@@ -17,10 +17,10 @@
 #pragma once
 
 #include <stdlib.h>
-#include <uv.h>
 
 struct rcbuf {
-	uv_buf_t uv;
+	void* payload;
+	size_t size;
 	int ref;
 };
 
@@ -31,8 +31,8 @@ static inline struct rcbuf* rcbuf_new(void* payload, size_t size)
 		return NULL;
 
 	self->ref = 0;
-	self->uv.base = payload;
-	self->uv.len = size;
+	self->payload = payload;
+	self->size = size;
 
 	return self;
 }
@@ -47,6 +47,6 @@ static inline void rcbuf_unref(struct rcbuf* self)
 	if (--self->ref > 0)
 		return;
 
-	free(self->uv.base);
+	free(self->payload);
 	free(self);
 }

@@ -14,43 +14,141 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-
 #include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <assert.h>
+#include <errno.h>
+#include <sys/uio.h>
 #include <uv.h>
 
 #include "type-macros.h"
 #include "rcbuf.h"
 #include "stream.h"
+#include "sys/queue.h"
 
+void stream__on_event(uv_poll_t* uv_poll, int status, int events);
 
-struct stream_write_req {
-	uv_write_t req;
-	struct rcbuf* payload;
-	void (*on_done)(void*);
-	void* userdata;
-};
-
-int stream__init(struct stream* self, enum stream_type type)
+void stream__poll_r(struct stream* self)
 {
-	switch (type) {
-	case STREAM_TCP:
-		return uv_tcp_init(uv_default_loop(), &self->tcp);
-	case STREAM_PIPE:
-		return uv_pipe_init(uv_default_loop(), &self->pipe, 0);
-	default:
-		return -1;
-	}
+	uv_poll_start(&self->uv_poll, UV_READABLE | UV_DISCONNECT,
+	              stream__on_event);
 }
 
-struct stream* stream_new(enum stream_type type)
+void stream__poll_rw(struct stream* self)
+{
+	uv_poll_start(&self->uv_poll, UV_READABLE | UV_DISCONNECT | UV_WRITABLE,
+	              stream__on_event);
+}
+
+void stream_req__finish(struct stream_req* req, enum stream_req_status status)
+{
+	if (req->on_done)
+		req->on_done(req->userdata, status);
+
+	rcbuf_unref(req->payload);
+	free(req);
+}
+
+void stream__remote_closed(struct stream* self)
+{
+	uv_poll_stop(&self->uv_poll);
+	close(self->fd);
+	self->fd = -1;
+}
+
+int stream__flush(struct stream* self)
+{
+	static struct iovec iov[IOV_MAX];
+	size_t n_msgs = 0;
+	ssize_t bytes_sent;
+
+	struct stream_req* req;
+	TAILQ_FOREACH(req, &self->send_queue, link) {
+		iov[n_msgs].iov_base = req->payload->payload;
+		iov[n_msgs].iov_len = req->payload->size;
+
+		if (++n_msgs >= IOV_MAX)
+			break;
+	}
+
+	if (n_msgs < 0)
+		return 0;
+
+	bytes_sent = writev(self->fd, iov, n_msgs);
+	if (bytes_sent < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			stream__poll_rw(self);
+		else if (errno == EPIPE)
+			stream__remote_closed(self);
+
+		return bytes_sent;
+	}
+
+	ssize_t bytes_left = bytes_sent;
+
+	struct stream_req* tmp;
+	TAILQ_FOREACH_SAFE(req, &self->send_queue, link, tmp) {
+		bytes_left -= req->payload->size;
+
+		if (bytes_left >= 0) {
+			TAILQ_REMOVE(&self->send_queue, req, link);
+			stream_req__finish(req, STREAM_REQ_DONE);
+		} else {
+			char* p = req->payload->payload;
+			size_t s = req->payload->size;
+			memmove(p, p + s - bytes_left, -bytes_left);
+		}
+
+		if (bytes_left <= 0)
+			break;
+	}
+
+	if (bytes_left == 0)
+		stream__poll_r(self);
+
+	assert(bytes_left < 0);
+
+	return bytes_sent;
+}
+
+void stream__on_readable(struct stream* self)
+{
+	if (self->on_event)
+		self->on_event(self);
+}
+
+void stream__on_event(uv_poll_t* uv_poll, int status, int events)
+{
+	struct stream* self = container_of(uv_poll, struct stream, uv_poll);
+
+	if (status & UV_WRITABLE)
+		stream__flush(self);
+
+	if (status & UV_READABLE)
+		stream__on_readable(self);
+
+	if (status & UV_DISCONNECT)
+		stream__remote_closed(self);
+}
+
+struct stream* stream_new(enum stream_flags flags, int fd,
+                          stream_event_fn on_event, void* userdata)
 {
 	struct stream* self = calloc(1, sizeof(*self));
 	if (!self)
 		return NULL;
 
-	if (stream__init(self, type) < 0)
+	self->ref = 1;
+	self->flags |= flags;
+	self->fd = fd;
+	self->on_event = on_event;
+	self->userdata = userdata;
+
+	if (uv_poll_init(uv_default_loop(), &self->uv_poll, fd) < 0)
 		goto failure;
+
+	stream__poll_r(self);
 
 	return self;
 
@@ -59,70 +157,93 @@ failure:
 	return NULL;
 }
 
-void stream__on_close(uv_handle_t* uv_handle)
+void stream_tls_destroy(struct stream_tls* tls)
 {
-	struct stream* self = container_of(uv_handle, struct stream, handle);
+}
+
+void stream_ref(struct stream* self)
+{
+	++self->ref;
+}
+
+void stream_unref(struct stream* self)
+{
+	assert(self->ref > 0);
+
+	if (--self->ref != 0)
+		return;
+
+	if (self->flags & STREAM_TLS)
+		stream_tls_destroy(&self->tls);
+
+	while (!TAILQ_EMPTY(&self->send_queue)) {
+		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
+		TAILQ_REMOVE(&self->send_queue, req, link);
+		stream_req__finish(req, STREAM_REQ_FAILED);
+	}
+
+	uv_poll_stop(&self->uv_poll);
+	close(self->fd);
 	free(self);
 }
 
-void stream_close(struct stream* self)
-{
-	if (--self->ref > 0)
-		return;
-
-#ifdef HAVE_TLS
-	if (self->tcp & STREAM_TLS)
-		stream_tls_destroy(&self->tls);
-#endif
-
-	uv_read_stop(&self->stream);
-	uv_close(&self->handle, stream__on_close);
-}
-
-void stream__on_write_done(uv_write_t* uv_req, int status)
-{
-	struct stream_write_req* req = (struct stream_write_req*)uv_req;
-
-	if (req->on_done)
-		req->on_done(req->userdata);
-
-	rcbuf_unref(req->payload);
-	free(req);
-}
-
 int stream__write_plain(struct stream* self, struct rcbuf* payload,
-                        void (*on_done)(void*), void* userdata)
+                        stream_req_fn on_done, void* userdata)
 {
-	struct stream_write_req* req = calloc(1, sizeof(*req));
+
+	struct stream_req* req = calloc(1, sizeof(*req));
 	if (!req)
 		return -1;
 
-	rcbuf_ref(payload);
-
 	req->payload = payload;
 	req->on_done = on_done;
-	req->userdata = req->userdata;
+	req->userdata = userdata;
 
-	int rc = uv_write(&req->req, &self->stream, &payload->uv, 1,
-	                  stream__on_write_done);
-	if (rc < 0) {
-		rcbuf_unref(payload);
-		free(req);
-	}
+	TAILQ_INSERT_TAIL(&self->send_queue, req, link);
 
-	return rc;
+	return stream__flush(self);
 }
 
 int stream__write_tls(struct stream* self, struct rcbuf* payload,
-                 void (*on_done)(void*), void* userdata)
+                      stream_req_fn on_done, void* userdata)
 {
+	// TODO
 	return -1;
 }
 
-int stream_write(struct stream* self, struct rcbuf* payload,
-                 void (*on_done)(void*), void* userdata)
+ssize_t stream__read_plain(struct stream* self, void* dst, size_t size)
 {
-	return (self->type & STREAM_TLS)
+	return read(self->fd, dst, size);
+}
+
+ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
+{
+#ifdef ENABLE_TLS
+	return SSL_read(self->ssl, dst, size);
+#endif
+}
+
+ssize_t stream_read(struct stream* self, void* dst, size_t size)
+{
+	if (self->fd < 0) {
+		errno = EPIPE;
+		return -1;
+	}
+
+	return (self->flags & STREAM_TLS)
+	     ? stream__read_tls(self, dst, size)
+	     : stream__read_plain(self, dst, size);
+}
+
+int stream_write(struct stream* self, struct rcbuf* payload,
+                 stream_req_fn on_done, void* userdata)
+{
+	if (self->fd < 0) {
+		errno = EPIPE;
+		return -1;
+	}
+
+	return (self->flags & STREAM_TLS)
 	     ? stream__write_tls(self, payload, on_done, userdata)
 	     : stream__write_plain(self, payload, on_done, userdata);
 }

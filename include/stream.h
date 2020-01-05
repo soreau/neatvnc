@@ -16,30 +16,54 @@
 
 #include <uv.h>
 
-enum stream_type {
-	STREAM_UNSPEC = 0,
+#include "config.h"
+#include "sys/queue.h"
+#include "rcbuf.h"
 
-	STREAM_TCP = 1 << 0,
-	STREAM_PIPE = 1 << 1,
+#ifdef ENABLE_TLS
+#include <openssl/ssl.h>
+#endif
 
-	STREAM_TLS = 1 << 8,
+enum stream_flags {
+	STREAM_TLS = 1 << 0,
 };
 
-struct stream_tls {
+enum stream_status {
+	STREAM_READY = 0,
+	STREAM_CLOSED,
 };
+
+enum stream_req_status {
+	STREAM_REQ_DONE = 0,
+	STREAM_REQ_FAILED,
+};
+
+struct stream;
+
+typedef void (*stream_event_fn)(struct stream*);
+typedef void (*stream_req_fn)(void*, enum stream_req_status);
+
+struct stream_req {
+	struct rcbuf* payload;
+	stream_req_fn on_done;
+	void* userdata;
+	TAILQ_ENTRY(stream_req) link;
+};
+
+TAILQ_HEAD(stream_send_queue, stream_req);
 
 struct stream {
-	enum stream_type type;
 	int ref;
+	enum stream_flags flags;
 
-	union {
-		uv_handle_t handle;
-		uv_stream_t stream;
-		uv_tcp_t tcp;
-		uv_pipe_t pipe;
-	};
+	int fd;
+	uv_poll_t uv_poll;
+	stream_event_fn on_event;
+	void* userdata;
 
-#ifdef HAVE_TLS
-	struct stream_tls tls;
+	struct stream_send_queue send_queue;
+
+#ifdef ENABLE_TLS
+	SSL* ssl;
 #endif
 };
