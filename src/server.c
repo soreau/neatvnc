@@ -25,6 +25,7 @@
 #include "neatvnc.h"
 #include "common.h"
 #include "pixels.h"
+#include "stream.h"
 #include "config.h"
 
 #include <stdlib.h>
@@ -73,19 +74,10 @@ static const char* fourcc_to_string(uint32_t fourcc)
 	return buffer;
 }
 
-static void allocate_read_buffer(uv_handle_t* handle, size_t suggested_size,
-                                 uv_buf_t* buf)
+static void client_close(struct nvnc_client* client)
 {
-	(void)suggested_size;
-
-	buf->base = malloc(READ_BUFFER_SIZE);
-	buf->len = buf->base ? READ_BUFFER_SIZE : 0;
-}
-
-static void cleanup_client(uv_handle_t* handle)
-{
-	struct nvnc_client* client = container_of(
-	        (uv_tcp_t*)handle, struct nvnc_client, stream_handle);
+	printf("Closing client...\n");
+	stream_unref(client->net_stream);
 
 	nvnc_client_fn fn = client->cleanup_fn;
 	if (fn)
@@ -98,13 +90,9 @@ static void cleanup_client(uv_handle_t* handle)
 	free(client);
 }
 
-static inline void client_close(struct nvnc_client* client)
-{
-	uv_close((uv_handle_t*)&client->stream_handle, cleanup_client);
-}
-
 static inline void client_unref(struct nvnc_client* client)
 {
+	printf("client unref %d\n", client->ref);
 	if (--client->ref == 0)
 		client_close(client);
 }
@@ -114,11 +102,9 @@ static inline void client_ref(struct nvnc_client* client)
 	++client->ref;
 }
 
-static void close_after_write(uv_write_t* req, int status)
+static void close_after_write(void* userdata, enum stream_req_status status)
 {
-	struct nvnc_client* client = container_of(
-	        (uv_tcp_t*)req->handle, struct nvnc_client, stream_handle);
-
+	struct nvnc_client* client = userdata;
 	client_unref(client);
 }
 
@@ -136,9 +122,10 @@ static int handle_unsupported_version(struct nvnc_client* client)
 	reason->length = htonl(strlen(reason_string));
 	(void)strcmp(reason->message, reason_string);
 
-	vnc__write((uv_stream_t*)&client->stream_handle, buffer,
-	           1 + sizeof(*reason) + strlen(reason_string),
-	           close_after_write);
+	struct rcbuf* payload =
+		rcbuf_from_mem(buffer,
+		               1 + sizeof(*reason) + strlen(reason_string));
+	stream_write(client->net_stream, payload, close_after_write, client);
 
 	return 0;
 }
@@ -164,8 +151,8 @@ static int on_version_message(struct nvnc_client* client)
 	};
 	/* clang-format on */
 
-	vnc__write((uv_stream_t*)&client->stream_handle, &security,
-	           sizeof(security), NULL);
+	struct rcbuf* payload = rcbuf_from_mem(&security, sizeof(security));
+	stream_write(client->net_stream, payload, NULL, NULL);
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
 	return 12;
@@ -188,9 +175,10 @@ static int handle_invalid_security_type(struct nvnc_client* client)
 	reason->length = htonl(strlen(reason_string));
 	(void)strcmp(reason->message, reason_string);
 
-	vnc__write((uv_stream_t*)&client->stream_handle, buffer,
-	           sizeof(*result) + sizeof(*reason) + strlen(reason_string),
-	           close_after_write);
+	struct rcbuf* payload =
+		rcbuf_from_mem(buffer, sizeof(*result) + sizeof(*reason) +
+			               strlen(reason_string));
+	stream_write(client->net_stream, payload, close_after_write, client);
 
 	return 0;
 }
@@ -208,8 +196,8 @@ static int on_security_message(struct nvnc_client* client)
 	enum rfb_security_handshake_result result =
 	        htonl(RFB_SECURITY_HANDSHAKE_OK);
 
-	vnc__write((uv_stream_t*)&client->stream_handle, &result,
-	           sizeof(result), NULL);
+	struct rcbuf* payload = rcbuf_from_mem(&result, sizeof(result));
+	stream_write(client->net_stream, payload, NULL, NULL);
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 	return sizeof(type);
@@ -251,9 +239,8 @@ static void send_server_init_message(struct nvnc_client* client)
 	msg->pixel_format.green_max = htons(msg->pixel_format.green_max);
 	msg->pixel_format.blue_max = htons(msg->pixel_format.blue_max);
 
-	vnc__write((uv_stream_t*)&client->stream_handle, msg, size, NULL);
-
-	free(msg);
+	struct rcbuf* payload = rcbuf_new(msg, size);
+	stream_write(client->net_stream, payload, NULL, NULL);
 }
 
 static int on_init_message(struct nvnc_client* client)
@@ -497,18 +484,27 @@ static int try_read_client_message(struct nvnc_client* client)
 	return 0;
 }
 
-static void on_client_read(uv_stream_t* stream, ssize_t n_read,
-                           const uv_buf_t* buf)
+static void on_client_event(struct stream* stream, enum stream_event event)
 {
-	struct nvnc_client* client = container_of(
-	        (uv_tcp_t*)stream, struct nvnc_client, stream_handle);
+	struct nvnc_client* client = stream->userdata;
+
+	if (event == STREAM_EVENT_CLOSE) {
+		client_unref(client);
+		return;
+	}
+
+#define BUF_SIZE 16384
+	char* buf = malloc(BUF_SIZE);
+	ssize_t n_read = stream_read(stream, buf, BUF_SIZE);
+#undef BUF_SIZE
 
 	if (n_read == 0)
 		goto done;
 
 	if (n_read < 0) {
-		uv_read_stop(stream);
-		client_unref(client);
+		if (errno != EAGAIN)
+			client_unref(client);
+
 		goto done;
 	}
 
@@ -517,12 +513,11 @@ static void on_client_read(uv_stream_t* stream, ssize_t n_read,
 	if ((size_t)n_read > MSG_BUFFER_SIZE - client->buffer_len) {
 		/* Can't handle this. Let's just give up */
 		client->state = VNC_CLIENT_STATE_ERROR;
-		uv_read_stop(stream);
 		client_unref(client);
 		goto done;
 	}
 
-	memcpy(client->msg_buffer + client->buffer_len, buf->base, n_read);
+	memcpy(client->msg_buffer + client->buffer_len, buf, n_read);
 	client->buffer_len += n_read;
 
 	while (1) {
@@ -541,13 +536,13 @@ static void on_client_read(uv_stream_t* stream, ssize_t n_read,
 	client->buffer_index = 0;
 
 done:
-	free(buf->base);
+	free(buf);
 }
 
-static void on_connection(uv_stream_t* server_stream, int status)
+static void on_connection(uv_poll_t* poll_handle, int status, int events)
 {
 	struct nvnc* server =
-	        container_of((uv_tcp_t*)server_stream, struct nvnc, tcp_handle);
+	        container_of(poll_handle, struct nvnc, poll_handle);
 
 	struct nvnc_client* client = calloc(1, sizeof(*client));
 	if (!client)
@@ -570,44 +565,19 @@ static void on_connection(uv_stream_t* server_stream, int status)
 
 	pixman_region_init(&client->damage);
 
-	uv_tcp_init(uv_default_loop(), &client->stream_handle);
+	int fd = accept(server->fd, NULL, 0);
+	assert(fd >= 0); //TODO
 
-	uv_accept((uv_stream_t*)&server->tcp_handle,
-	          (uv_stream_t*)&client->stream_handle);
+	client->net_stream = stream_new(0, fd, on_client_event, client);
+	assert(client->net_stream); // TODO
 
-	uv_read_start((uv_stream_t*)&client->stream_handle,
-	              allocate_read_buffer, on_client_read);
-
-	vnc__write((uv_stream_t*)&client->stream_handle, RFB_VERSION_MESSAGE,
-	           strlen(RFB_VERSION_MESSAGE), NULL);
+	struct rcbuf* payload = rcbuf_from_string(RFB_VERSION_MESSAGE);
+	assert(payload); //TODO
+	stream_write(client->net_stream, payload, NULL, NULL);
 
 	LIST_INSERT_HEAD(&server->clients, client, link);
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VERSION;
-}
-
-int vnc_server_init(struct nvnc* self, const char* address, int port)
-{
-	LIST_INIT(&self->clients);
-
-	uv_tcp_init(uv_default_loop(), &self->tcp_handle);
-
-	struct sockaddr_in addr = {0};
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = inet_addr(address);
-	addr.sin_port = htons(port);
-
-	if (uv_tcp_bind(&self->tcp_handle, (const struct sockaddr*)&addr, 0) < 0)
-		goto failure;
-
-	if (uv_listen((uv_stream_t*)&self->tcp_handle, 16, on_connection) < 0)
-		goto failure;
-
-	return 0;
-
-failure:
-	uv_unref((uv_handle_t*)&self->tcp_handle);
-	return -1;
 }
 
 EXPORT
@@ -621,22 +591,32 @@ struct nvnc* nvnc_open(const char* address, uint16_t port)
 
 	LIST_INIT(&self->clients);
 
-	uv_tcp_init(uv_default_loop(), &self->tcp_handle);
+	self->fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (self->fd < 0)
+		return NULL;
+
+	int one = 1;
+	if (setsockopt(self->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int)) < 0)
+		goto failure;
 
 	struct sockaddr_in addr = {0};
 	addr.sin_family = AF_INET;
 	addr.sin_addr.s_addr = inet_addr(address);
 	addr.sin_port = htons(port);
 
-	if (uv_tcp_bind(&self->tcp_handle, (const struct sockaddr*)&addr, 0) < 0)
+	if (bind(self->fd, (const struct sockaddr*)&addr, sizeof(addr)) < 0)
 		goto failure;
 
-	if (uv_listen((uv_stream_t*)&self->tcp_handle, 16, on_connection) < 0)
+	if (listen(self->fd, 16) < 0)
 		goto failure;
+
+	uv_poll_init(uv_default_loop(), &self->poll_handle, self->fd);
+	uv_poll_start(&self->poll_handle, UV_READABLE, on_connection);
 
 	return self;
+
 failure:
-	uv_unref((uv_handle_t*)&self->tcp_handle);
+	close(self->fd);
 	return NULL;
 }
 
@@ -651,16 +631,16 @@ void nvnc_close(struct nvnc* self)
 	LIST_FOREACH (client, &self->clients, link)
 		client_unref(client);
 
-	uv_unref((uv_handle_t*)&self->tcp_handle);
+	uv_poll_stop(&self->poll_handle);
+	close(self->fd);
 	free(self);
 }
 
-static void on_write_frame_done(uv_write_t* req, int status)
+static void on_write_frame_done(void* userdata, enum stream_req_status status)
 {
-	struct vnc_write_request* rq = (struct vnc_write_request*)req;
-	struct nvnc_client* client = rq->userdata;
+	struct nvnc_client* client = userdata;
 	client->is_updating = false;
-	free(rq->buffer.base);
+	client_unref(client);
 }
 
 enum rfb_encodings choose_frame_encoding(struct nvnc_client* client)
@@ -715,19 +695,21 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 
 	struct fb_update_work* update = (void*)work;
 	struct nvnc_client* client = update->client;
-	struct nvnc* server = client->server;
 	struct vec* frame = &update->frame;
 
-	if (!uv_is_closing((uv_handle_t*)&client->stream_handle))
-		vnc__write2((uv_stream_t*)&client->stream_handle, frame->data,
-		            frame->len, on_write_frame_done, client);
-	else
+	if (!uv_is_closing((uv_handle_t*)&client->stream_handle)) {
+		struct rcbuf* payload = rcbuf_new(frame->data, frame->len);
+		stream_write(client->net_stream, payload, on_write_frame_done,
+		             client);
+	} else {
 		client->is_updating = false;
+		vec_destroy(frame);
+		client_unref(client);
+	}
 
 	client->n_pending_requests--;
 	process_fb_update_requests(client);
 	nvnc_fb_unref(update->fb);
-	client_unref(client);
 
 	pixman_region_fini(&update->region);
 	free(update);

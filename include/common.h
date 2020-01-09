@@ -23,6 +23,7 @@ enum nvnc_client_state {
 };
 
 struct nvnc;
+struct stream;
 
 struct nvnc_common {
 	void* userdata;
@@ -32,6 +33,7 @@ struct nvnc_client {
 	struct nvnc_common common;
 	int ref;
 	struct uv_tcp_s stream_handle;
+	struct stream* net_stream;
 	struct nvnc* server;
 	enum nvnc_client_state state;
 	uint32_t fourcc;
@@ -60,7 +62,8 @@ struct vnc_display {
 
 struct nvnc {
 	struct nvnc_common common;
-	uv_tcp_t tcp_handle;
+	int fd;
+	uv_poll_t poll_handle;
 	struct nvnc_client_list clients;
 	struct vnc_display display;
 	void* userdata;

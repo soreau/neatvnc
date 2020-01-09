@@ -10,6 +10,7 @@ SOURCES := \
 	src/pixels.c \
 	src/damage.c \
 	src/fb.c \
+	src/stream.c \
 
 include common.mk
 

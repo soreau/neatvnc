@@ -38,9 +38,14 @@ enum stream_req_status {
 	STREAM_REQ_FAILED,
 };
 
+enum stream_event {
+	STREAM_EVENT_READ,
+	STREAM_EVENT_CLOSE,
+};
+
 struct stream;
 
-typedef void (*stream_event_fn)(struct stream*);
+typedef void (*stream_event_fn)(struct stream*, enum stream_event);
 typedef void (*stream_req_fn)(void*, enum stream_req_status);
 
 struct stream_req {
@@ -67,3 +72,11 @@ struct stream {
 	SSL* ssl;
 #endif
 };
+
+struct stream* stream_new(enum stream_flags flags, int fd,
+                          stream_event_fn on_event, void* userdata);
+void stream_ref(struct stream* self);
+void stream_unref(struct stream* self);
+ssize_t stream_read(struct stream* self, void* dst, size_t size);
+int stream_write(struct stream* self, struct rcbuf* payload,
+                 stream_req_fn on_done, void* userdata);

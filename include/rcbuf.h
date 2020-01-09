@@ -17,6 +17,7 @@
 #pragma once
 
 #include <stdlib.h>
+#include <string.h>
 
 struct rcbuf {
 	void* payload;
@@ -35,6 +36,27 @@ static inline struct rcbuf* rcbuf_new(void* payload, size_t size)
 	self->size = size;
 
 	return self;
+}
+
+static inline struct rcbuf* rcbuf_from_string(const char* str)
+{
+	char* value = strdup(str);
+	return value ? rcbuf_new(value, strlen(str)) : NULL;
+}
+
+static inline struct rcbuf* rcbuf_from_mem(const void* addr, size_t size)
+{
+	void* mem = malloc(size);
+	if (!mem)
+		return NULL;
+
+	memcpy(mem, addr, size);
+
+	struct rcbuf* rcbuf = rcbuf_new(mem, size);
+	if (!rcbuf)
+		free(mem);
+
+	return rcbuf;
 }
 
 static inline void rcbuf_ref(struct rcbuf* self)
