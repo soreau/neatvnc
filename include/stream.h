@@ -22,7 +22,14 @@
 
 #ifdef ENABLE_TLS
 #include <openssl/ssl.h>
+#include <openssl/err.h>
 #endif
+
+enum stream_state {
+	STREAM_STATE_NORMAL = 0,
+	STREAM_STATE_TLS_HANDSHAKE,
+	STREAM_STATE_TLS_READY,
+};
 
 enum stream_flags {
 	STREAM_TLS = 1 << 0,
@@ -60,6 +67,7 @@ TAILQ_HEAD(stream_send_queue, stream_req);
 struct stream {
 	int ref;
 	enum stream_flags flags;
+	enum stream_state state;
 
 	int fd;
 	uv_poll_t uv_poll;
@@ -80,3 +88,5 @@ void stream_unref(struct stream* self);
 ssize_t stream_read(struct stream* self, void* dst, size_t size);
 int stream_write(struct stream* self, struct rcbuf* payload,
                  stream_req_fn on_done, void* userdata);
+
+int stream_upgrade_to_tls(struct stream* self, void* context);

@@ -1,4 +1,4 @@
-DEPENDENCIES := pixman-1 libuv libturbojpeg
+DEPENDENCIES := pixman-1 libuv libturbojpeg openssl
 
 SOURCES := \
 	src/server.c \

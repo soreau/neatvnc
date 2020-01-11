@@ -53,6 +53,12 @@ void on_pointer_event(struct nvnc_client* client, uint16_t x, uint16_t y,
 	pixman_region_fini(&region);
 }
 
+bool authenticate(const char* username, const char* password, void* ud)
+{
+	return strcmp(username, "luser") == 0
+	    && strcmp(password, "foobar") == 0;
+}
+
 int main(int argc, char* argv[])
 {
 	struct draw draw;
@@ -72,6 +78,7 @@ int main(int argc, char* argv[])
 	nvnc_set_name(server, "Draw");
 	nvnc_set_pointer_fn(server, on_pointer_event);
 	nvnc_set_userdata(server, &draw);
+	nvnc_enable_auth(server, "./key.pem", "./cert.pem", authenticate, NULL);
 
 	uv_run(uv_default_loop(), UV_RUN_DEFAULT);
 

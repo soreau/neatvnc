@@ -14,6 +14,7 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <openssl/ssl.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -27,21 +28,28 @@
 #include "stream.h"
 #include "sys/queue.h"
 
-void stream__on_event(uv_poll_t* uv_poll, int status, int events);
+static void stream__on_event(uv_poll_t* uv_poll, int status, int events);
+static int stream__try_tls_accept(struct stream* self);
 
-void stream__poll_r(struct stream* self)
+static inline void stream__poll_r(struct stream* self)
 {
 	uv_poll_start(&self->uv_poll, UV_READABLE | UV_DISCONNECT,
 	              stream__on_event);
 }
 
-void stream__poll_rw(struct stream* self)
+static inline void stream__poll_w(struct stream* self)
+{
+	uv_poll_start(&self->uv_poll, UV_WRITABLE | UV_DISCONNECT,
+	              stream__on_event);
+}
+
+static inline void stream__poll_rw(struct stream* self)
 {
 	uv_poll_start(&self->uv_poll, UV_READABLE | UV_DISCONNECT | UV_WRITABLE,
 	              stream__on_event);
 }
 
-void stream_req__finish(struct stream_req* req, enum stream_req_status status)
+static void stream_req__finish(struct stream_req* req, enum stream_req_status status)
 {
 	if (req->on_done)
 		req->on_done(req->userdata, status);
@@ -50,7 +58,7 @@ void stream_req__finish(struct stream_req* req, enum stream_req_status status)
 	free(req);
 }
 
-void stream__remote_closed(struct stream* self)
+static void stream__remote_closed(struct stream* self)
 {
 	uv_poll_stop(&self->uv_poll);
 	close(self->fd);
@@ -60,7 +68,7 @@ void stream__remote_closed(struct stream* self)
 		self->on_event(self, STREAM_EVENT_CLOSE);
 }
 
-int stream__flush(struct stream* self)
+static int stream__flush(struct stream* self)
 {
 	static struct iovec iov[IOV_MAX];
 	size_t n_msgs = 0;
@@ -122,19 +130,74 @@ int stream__flush(struct stream* self)
 	return bytes_sent;
 }
 
-void stream__on_readable(struct stream* self)
+static int stream__tls_flush(struct stream* self)
 {
-	printf("Got event\n");
-	if (self->on_event)
-		self->on_event(self, STREAM_EVENT_READ);
+	while (!TAILQ_EMPTY(&self->send_queue)) {
+		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
+
+		size_t n_bytes = 0;
+		int rc = SSL_write_ex(self->ssl, req->payload->payload,
+		                      req->payload->size, &n_bytes);
+		if (rc == 0) {
+			int err = SSL_get_error(self->ssl, rc);
+			if (err == SSL_ERROR_WANT_WRITE)
+				stream__poll_rw(self);
+			else if (err != SSL_ERROR_WANT_READ) {
+				// TODO: Do more to close the socket
+				errno = EPIPE;
+				return -1;
+			}
+
+			break;
+		}
+
+		// TODO: Enable and handle partial writes
+
+		TAILQ_REMOVE(&self->send_queue, req, link);
+		stream_req__finish(req, STREAM_REQ_DONE);
+	}
+
+	if (TAILQ_EMPTY(&self->send_queue))
+		stream__poll_r(self);
+
+	return 1;
 }
 
-void stream__on_event(uv_poll_t* uv_poll, int status, int events)
+static void stream__on_readable(struct stream* self)
+{
+	switch (self->state) {
+	case STREAM_STATE_NORMAL:
+	case STREAM_STATE_TLS_READY:
+		if (self->on_event)
+			self->on_event(self, STREAM_EVENT_READ);
+		break;
+	case STREAM_STATE_TLS_HANDSHAKE:
+		stream__try_tls_accept(self);
+		break;
+	}
+}
+
+static void stream__on_writable(struct stream* self)
+{
+	switch (self->state) {
+	case STREAM_STATE_NORMAL:
+		stream__flush(self);
+		break;
+	case STREAM_STATE_TLS_HANDSHAKE:
+		stream__try_tls_accept(self);
+		break;
+	case STREAM_STATE_TLS_READY:
+		stream__tls_flush(self);
+		break;
+	}
+}
+
+static void stream__on_event(uv_poll_t* uv_poll, int status, int events)
 {
 	struct stream* self = container_of(uv_poll, struct stream, uv_poll);
 
 	if (events & UV_WRITABLE)
-		stream__flush(self);
+		stream__on_writable(self);
 
 	if (events & UV_READABLE)
 		stream__on_readable(self);
@@ -185,7 +248,7 @@ void stream_unref(struct stream* self)
 		return;
 
 #ifdef ENABLE_TLS
-	if (self->flags & STREAM_TLS)
+	if (self->ssl)
 		SSL_free(self->ssl);
 #endif
 
@@ -201,10 +264,9 @@ void stream_unref(struct stream* self)
 	free(self);
 }
 
-int stream__write_plain(struct stream* self, struct rcbuf* payload,
-                        stream_req_fn on_done, void* userdata)
+int stream_write(struct stream* self, struct rcbuf* payload,
+                 stream_req_fn on_done, void* userdata)
 {
-
 	struct stream_req* req = calloc(1, sizeof(*req));
 	if (!req)
 		return -1;
@@ -218,13 +280,6 @@ int stream__write_plain(struct stream* self, struct rcbuf* payload,
 	return stream__flush(self);
 }
 
-int stream__write_tls(struct stream* self, struct rcbuf* payload,
-                      stream_req_fn on_done, void* userdata)
-{
-	// TODO
-	return -1;
-}
-
 ssize_t stream__read_plain(struct stream* self, void* dst, size_t size)
 {
 	return read(self->fd, dst, size);
@@ -234,33 +289,61 @@ ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 {
 #ifdef ENABLE_TLS
 	return SSL_read(self->ssl, dst, size);
+#else
+	return -1;
 #endif
 }
 
 ssize_t stream_read(struct stream* self, void* dst, size_t size)
 {
-	printf("Stream read %lu\n", size);
-
 	if (self->fd < 0) {
 		errno = EPIPE;
 		return -1;
 	}
 
-	return (self->flags & STREAM_TLS)
-	     ? stream__read_tls(self, dst, size)
-	     : stream__read_plain(self, dst, size);
+	switch (self->state) {
+	case STREAM_STATE_NORMAL: return stream__read_plain(self, dst, size);
+	case STREAM_STATE_TLS_READY: return stream__read_tls(self, dst, size);
+	default: break;
+	}
+
+	errno = EAGAIN;
+	return -1;
 }
 
-int stream_write(struct stream* self, struct rcbuf* payload,
-                 stream_req_fn on_done, void* userdata)
+static int stream__try_tls_accept(struct stream* self)
 {
-	printf("Stream write %lu\n", payload->size);
-	if (self->fd < 0) {
-		errno = EPIPE;
+	int rc = SSL_accept(self->ssl);
+	if (rc == 0)
 		return -1;
+
+	if (rc == 1) {
+		self->state = STREAM_STATE_TLS_READY;
+		stream__poll_r(self);
+		return 0;
 	}
 
-	return (self->flags & STREAM_TLS)
-	     ? stream__write_tls(self, payload, on_done, userdata)
-	     : stream__write_plain(self, payload, on_done, userdata);
+	assert(rc < 0);
+
+	int err = SSL_get_error(self->ssl, rc);
+	if (err == SSL_ERROR_WANT_READ)
+		stream__poll_r(self);
+	else if (err == SSL_ERROR_WANT_WRITE)
+		stream__poll_w(self);
+	else
+		return -1;
+
+	self->state = STREAM_STATE_TLS_HANDSHAKE;
+	return 0;
+}
+
+int stream_upgrade_to_tls(struct stream* self, void* context)
+{
+	self->ssl = SSL_new(context);
+	if (!self->ssl)
+		return -1;
+
+	SSL_set_fd(self->ssl, self->fd);
+
+	return stream__try_tls_accept(self);
 }

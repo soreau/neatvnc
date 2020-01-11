@@ -9,6 +9,11 @@
 
 #include "neatvnc.h"
 #include "miniz.h"
+#include "config.h"
+
+#ifdef ENABLE_TLS
+#include <openssl/ssl.h>
+#endif
 
 #define MAX_ENCODINGS 32
 #define MAX_OUTGOING_FRAMES 4
@@ -18,6 +23,9 @@ enum nvnc_client_state {
 	VNC_CLIENT_STATE_ERROR = -1,
 	VNC_CLIENT_STATE_WAITING_FOR_VERSION = 0,
 	VNC_CLIENT_STATE_WAITING_FOR_SECURITY,
+	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_VERSION,
+	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_SUBTYPE,
+	VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH,
 	VNC_CLIENT_STATE_WAITING_FOR_INIT,
 	VNC_CLIENT_STATE_READY,
 };
@@ -72,4 +80,10 @@ struct nvnc {
 	nvnc_fb_req_fn fb_req_fn;
 	nvnc_client_fn new_client_fn;
 	struct nvnc_fb* frame;
+
+#ifdef ENABLE_TLS
+	SSL_CTX* tls;
+	nvnc_auth_fn auth_fn;
+	void* auth_ud;
+#endif
 };

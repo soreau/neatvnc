@@ -37,6 +37,11 @@
 #include <pixman.h>
 #include <pthread.h>
 
+#ifdef ENABLE_TLS
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
+
 #ifndef DRM_FORMAT_INVALID
 #define DRM_FORMAT_INVALID 0
 #endif
@@ -132,6 +137,8 @@ static int handle_unsupported_version(struct nvnc_client* client)
 
 static int on_version_message(struct nvnc_client* client)
 {
+	struct nvnc* server = client->server;
+
 	if (client->buffer_len - client->buffer_index < 12)
 		return 0;
 
@@ -142,14 +149,14 @@ static int on_version_message(struct nvnc_client* client)
 	if (strcmp(RFB_VERSION_MESSAGE, version_string) != 0)
 		return handle_unsupported_version(client);
 
-	/* clang-format off */
-	const static struct rfb_security_types_msg security = {
-		.n = 1,
-		.types = {
-			RFB_SECURITY_TYPE_NONE,
-		},
-	};
-	/* clang-format on */
+	struct rfb_security_types_msg security = { 0 };
+	security.n = 1;
+	security.types[0] = RFB_SECURITY_TYPE_NONE;
+
+#ifdef ENABLE_TLS
+	if (server->auth_fn)
+		security.types[0] = RFB_SECURITY_TYPE_VENCRYPT;
+#endif
 
 	struct rcbuf* payload = rcbuf_from_mem(&security, sizeof(security));
 	stream_write(client->net_stream, payload, NULL, NULL);
@@ -183,6 +190,118 @@ static int handle_invalid_security_type(struct nvnc_client* client)
 	return 0;
 }
 
+static int security_handshake_ok(struct nvnc_client* client)
+{
+	uint8_t result = htonl(RFB_SECURITY_HANDSHAKE_OK);
+	struct rcbuf* payload = rcbuf_from_mem(&result, sizeof(result));
+	return stream_write(client->net_stream, payload, NULL, NULL);
+}
+
+static int vencrypt_send_version(struct nvnc_client* client)
+{
+	struct rfb_vencrypt_version_msg msg = {
+		.major = 0,
+		.minor = 2,
+	};
+
+	struct rcbuf* payload = rcbuf_from_mem(&msg, sizeof(msg));
+	return stream_write(client->net_stream, payload, NULL, NULL);
+}
+
+static int send_byte(struct nvnc_client* client, uint8_t value)
+{
+	struct rcbuf* payload = rcbuf_from_mem(&value, sizeof(value));
+	return stream_write(client->net_stream, payload, NULL, NULL);
+}
+
+static int on_vencrypt_version_message(struct nvnc_client* client)
+{
+	struct rfb_vencrypt_version_msg* msg =
+		(struct rfb_vencrypt_version_msg*)&client->msg_buffer[client->buffer_index];
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg))
+		return 0;
+
+	if (msg->major != 0 || msg->minor != 2) {
+		// TODO: Say unsupported vencrypt type in message
+		handle_invalid_security_type(client);
+		return sizeof(*msg);
+	}
+
+	security_handshake_ok(client);
+
+	struct rfb_vencrypt_subtypes_msg result = { .n = 1, };
+	result.types[0] = htonl(RFB_VENCRYPT_TLS_PLAIN);
+
+	struct rcbuf* payload = rcbuf_from_mem(&result, sizeof(result));
+	stream_write(client->net_stream, payload, NULL, NULL);
+
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_SUBTYPE;
+
+	send_byte(client, 1);
+
+	return sizeof(*msg);
+}
+
+static int on_vencrypt_subtype_message(struct nvnc_client* client)
+{
+	uint32_t* msg = (uint32_t*)&client->msg_buffer[client->buffer_index];
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg))
+		return 0;
+
+	enum rfb_vencrypt_subtype subtype = ntohl(*msg);
+
+	if (subtype != RFB_VENCRYPT_PLAIN) {
+		client_unref(client);
+		return 0;
+	}
+
+	if (stream_upgrade_to_tls(client->net_stream, client->server->tls) < 0) {
+		client_unref(client);
+		return 0;
+	}
+
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH;
+
+	// TODO: For tls send one byte containing only 1
+}
+
+static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
+{
+	struct nvnc* server = client->server;
+
+	struct rfb_vencrypt_plain_auth_msg* msg =
+	        (void*)(client->msg_buffer + client->buffer_index);
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg))
+		return 0;
+
+	uint32_t ulen = ntohl(msg->username_len);
+	uint32_t plen = ntohl(msg->password_len);
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg) + ulen + plen)
+		return 0;
+
+	char username[256];
+	char password[256];
+
+	memcpy(username, msg->text, MIN(ulen, sizeof(username) - 1));
+	memcpy(password, msg->text, MIN(plen, sizeof(password) - 1));
+
+	username[MIN(ulen, sizeof(username) - 1)] = '\0';
+	password[MIN(plen, sizeof(password) - 1)] = '\0';
+
+	if (server->auth_fn(username, password, server->auth_ud))
+		security_handshake_ok(client);
+	else
+		handle_invalid_security_type(client); // TODO say wrong auth
+
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+
+	return sizeof(*msg);
+}
+
 static int on_security_message(struct nvnc_client* client)
 {
 	if (client->buffer_len - client->buffer_index < 1)
@@ -190,16 +309,20 @@ static int on_security_message(struct nvnc_client* client)
 
 	uint8_t type = client->msg_buffer[client->buffer_index];
 
-	if (type != RFB_SECURITY_TYPE_NONE)
-		return handle_invalid_security_type(client);
+	switch (type) {
+	case RFB_SECURITY_TYPE_NONE:
+		security_handshake_ok(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+		break;
+	case RFB_SECURITY_TYPE_VENCRYPT:
+		vencrypt_send_version(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_VERSION;
+		break;
+	default:
+		handle_invalid_security_type(client);
+		break;
+	}
 
-	enum rfb_security_handshake_result result =
-	        htonl(RFB_SECURITY_HANDSHAKE_OK);
-
-	struct rcbuf* payload = rcbuf_from_mem(&result, sizeof(result));
-	stream_write(client->net_stream, payload, NULL, NULL);
-
-	client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 	return sizeof(type);
 }
 
@@ -476,6 +599,12 @@ static int try_read_client_message(struct nvnc_client* client)
 		return on_security_message(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_INIT:
 		return on_init_message(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_VERSION:
+		return on_vencrypt_version_message(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_SUBTYPE:
+		return on_vencrypt_subtype_message(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH:
+		return on_vencrypt_plain_auth_message(client);
 	case VNC_CLIENT_STATE_READY:
 		return on_client_message(client);
 	}
@@ -633,6 +762,11 @@ void nvnc_close(struct nvnc* self)
 
 	uv_poll_stop(&self->poll_handle);
 	close(self->fd);
+
+#ifdef ENABLE_TLS
+	SSL_CTX_free(self->tls);
+#endif
+
 	free(self);
 }
 
@@ -849,4 +983,48 @@ void nvnc_set_name(struct nvnc* self, const char* name)
 {
 	strncpy(self->display.name, name, sizeof(self->display.name));
 	self->display.name[sizeof(self->display.name) - 1] = '\0';
+}
+
+EXPORT
+bool nvnc_has_auth(void)
+{
+#ifdef ENABLE_TLS
+	return true;
+#else
+	return false;
+#endif
+}
+
+EXPORT
+int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
+                     const char* cert_path, nvnc_auth_fn auth_fn,
+                     void* userdata)
+{
+#ifdef ENABLE_TLS
+	if (self->tls)
+		return -1;
+
+	self->tls = SSL_CTX_new(TLS_server_method());
+	if (!self->tls)
+		return -1;
+
+	if (SSL_CTX_use_PrivateKey_file(self->tls, privkey_path,
+	                                SSL_FILETYPE_PEM) < 0)
+		goto failure;
+
+	if (SSL_CTX_use_certificate_file(self->tls, cert_path,
+	                                 SSL_FILETYPE_PEM) < 0)
+		goto failure;
+
+	self->auth_fn = auth_fn;
+	self->auth_ud = userdata;
+
+	return 0;
+
+failure:
+	// TODO: Expose errors to user via nvnc_strerror(struct nvnc*) -> const char*
+	SSL_CTX_free(self->tls);
+	self->tls = NULL;
+#endif
+	return -1;
 }
