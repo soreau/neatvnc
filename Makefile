@@ -20,7 +20,7 @@ DSO_NAME=libneatvnc
 DSO_MAJOR=0
 DSO_MINOR=0
 
-CFLAGS += -fvisibility=hidden -Icontrib/miniz
+CFLAGS += -fvisibility=hidden -Icontrib/miniz -fPIC
 OBJECTS += $(BUILD_DIR)/miniz.o
 
 DSO_PATH := $(BUILD_DIR)/$(DSO_NAME)

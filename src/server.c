@@ -192,7 +192,7 @@ static int handle_invalid_security_type(struct nvnc_client* client)
 
 static int security_handshake_ok(struct nvnc_client* client)
 {
-	uint8_t result = htonl(RFB_SECURITY_HANDSHAKE_OK);
+	uint32_t result = htonl(RFB_SECURITY_HANDSHAKE_OK);
 	struct rcbuf* payload = rcbuf_from_mem(&result, sizeof(result));
 	return stream_write(client->net_stream, payload, NULL, NULL);
 }
@@ -228,10 +228,10 @@ static int on_vencrypt_version_message(struct nvnc_client* client)
 		return sizeof(*msg);
 	}
 
-	security_handshake_ok(client);
+	send_byte(client, 0);
 
 	struct rfb_vencrypt_subtypes_msg result = { .n = 1, };
-	result.types[0] = htonl(RFB_VENCRYPT_TLS_PLAIN);
+	result.types[0] = htonl(RFB_VENCRYPT_X509_PLAIN);
 
 	struct rcbuf* payload = rcbuf_from_mem(&result, sizeof(result));
 	stream_write(client->net_stream, payload, NULL, NULL);
@@ -252,7 +252,7 @@ static int on_vencrypt_subtype_message(struct nvnc_client* client)
 
 	enum rfb_vencrypt_subtype subtype = ntohl(*msg);
 
-	if (subtype != RFB_VENCRYPT_PLAIN) {
+	if (subtype != RFB_VENCRYPT_X509_PLAIN) {
 		client_unref(client);
 		return 0;
 	}
@@ -265,6 +265,7 @@ static int on_vencrypt_subtype_message(struct nvnc_client* client)
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH;
 
 	// TODO: For tls send one byte containing only 1
+	return sizeof(*msg);
 }
 
 static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
@@ -287,10 +288,12 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 	char password[256];
 
 	memcpy(username, msg->text, MIN(ulen, sizeof(username) - 1));
-	memcpy(password, msg->text, MIN(plen, sizeof(password) - 1));
+	memcpy(password, msg->text + ulen, MIN(plen, sizeof(password) - 1));
 
 	username[MIN(ulen, sizeof(username) - 1)] = '\0';
 	password[MIN(plen, sizeof(password) - 1)] = '\0';
+
+	printf("Got auth %s:%s\n", username, password);
 
 	if (server->auth_fn(username, password, server->auth_ud))
 		security_handshake_ok(client);
@@ -299,7 +302,7 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 
-	return sizeof(*msg);
+	return sizeof(*msg) + ulen + plen;
 }
 
 static int on_security_message(struct nvnc_client* client)
@@ -654,6 +657,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 		if (rc == 0)
 			break;
 
+		printf("buffer index += %d\n", rc);
 		client->buffer_index += rc;
 	}
 
@@ -1004,9 +1008,18 @@ int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
 	if (self->tls)
 		return -1;
 
+	OpenSSL_add_all_algorithms();
+	OpenSSL_add_ssl_algorithms();
+	OpenSSL_add_all_ciphers();
+	OpenSSL_add_all_digests();
+
 	self->tls = SSL_CTX_new(TLS_server_method());
 	if (!self->tls)
 		return -1;
+
+//	SSL_CTX_set_verify(self->tls, SSL_VERIFY_NONE, 0);
+
+	SSL_CTX_set_ecdh_auto(self->tls, 1);
 
 	if (SSL_CTX_use_PrivateKey_file(self->tls, privkey_path,
 	                                SSL_FILETYPE_PEM) < 0)

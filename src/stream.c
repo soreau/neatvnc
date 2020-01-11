@@ -14,8 +14,10 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <string.h>
 #include <assert.h>
@@ -68,7 +70,7 @@ static void stream__remote_closed(struct stream* self)
 		self->on_event(self, STREAM_EVENT_CLOSE);
 }
 
-static int stream__flush(struct stream* self)
+static int stream__flush_plain(struct stream* self)
 {
 	static struct iovec iov[IOV_MAX];
 	size_t n_msgs = 0;
@@ -130,10 +132,12 @@ static int stream__flush(struct stream* self)
 	return bytes_sent;
 }
 
-static int stream__tls_flush(struct stream* self)
+static int stream__flush_tls(struct stream* self)
 {
 	while (!TAILQ_EMPTY(&self->send_queue)) {
 		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
+
+		printf("SSL_write\n");
 
 		size_t n_bytes = 0;
 		int rc = SSL_write_ex(self->ssl, req->payload->payload,
@@ -163,6 +167,17 @@ static int stream__tls_flush(struct stream* self)
 	return 1;
 }
 
+static int stream__flush(struct stream* self)
+{
+	switch (self->state) {
+	case STREAM_STATE_NORMAL: return stream__flush_plain(self);
+	case STREAM_STATE_TLS_READY: return stream__flush_tls(self);
+	default:
+		break;
+	}
+	return -1;
+}
+
 static void stream__on_readable(struct stream* self)
 {
 	switch (self->state) {
@@ -181,13 +196,11 @@ static void stream__on_writable(struct stream* self)
 {
 	switch (self->state) {
 	case STREAM_STATE_NORMAL:
+	case STREAM_STATE_TLS_READY:
 		stream__flush(self);
 		break;
 	case STREAM_STATE_TLS_HANDSHAKE:
 		stream__try_tls_accept(self);
-		break;
-	case STREAM_STATE_TLS_READY:
-		stream__tls_flush(self);
 		break;
 	}
 }
@@ -288,10 +301,19 @@ ssize_t stream__read_plain(struct stream* self, void* dst, size_t size)
 ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 {
 #ifdef ENABLE_TLS
-	return SSL_read(self->ssl, dst, size);
-#else
-	return -1;
+	int rc = SSL_read(self->ssl, dst, size);
+	if (rc > 0)
+		return rc;
+
+	int err = SSL_get_error(self->ssl, rc);
+	if (err == SSL_ERROR_WANT_READ) {
+		errno = EAGAIN;
+		return -1;
+	}
+
+	errno = EPIPE;
 #endif
+	return -1;
 }
 
 ssize_t stream_read(struct stream* self, void* dst, size_t size)
@@ -313,25 +335,29 @@ ssize_t stream_read(struct stream* self, void* dst, size_t size)
 
 static int stream__try_tls_accept(struct stream* self)
 {
+	printf("Trying TLS handshake\n");
 	int rc = SSL_accept(self->ssl);
 	if (rc == 0)
 		return -1;
 
 	if (rc == 1) {
+		printf("TLS handshake done\n");
 		self->state = STREAM_STATE_TLS_READY;
 		stream__poll_r(self);
 		return 0;
 	}
 
 	assert(rc < 0);
-
 	int err = SSL_get_error(self->ssl, rc);
+
 	if (err == SSL_ERROR_WANT_READ)
 		stream__poll_r(self);
 	else if (err == SSL_ERROR_WANT_WRITE)
 		stream__poll_w(self);
-	else
+	else {
+		ERR_print_errors_fp(stderr);
 		return -1;
+	}
 
 	self->state = STREAM_STATE_TLS_HANDSHAKE;
 	return 0;
@@ -339,6 +365,7 @@ static int stream__try_tls_accept(struct stream* self)
 
 int stream_upgrade_to_tls(struct stream* self, void* context)
 {
+	printf("Upgrading to TLS\n");
 	self->ssl = SSL_new(context);
 	if (!self->ssl)
 		return -1;

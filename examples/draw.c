@@ -78,7 +78,11 @@ int main(int argc, char* argv[])
 	nvnc_set_name(server, "Draw");
 	nvnc_set_pointer_fn(server, on_pointer_event);
 	nvnc_set_userdata(server, &draw);
-	nvnc_enable_auth(server, "./key.pem", "./cert.pem", authenticate, NULL);
+
+	if (nvnc_enable_auth(server, "./key.pem", "./cert.pem", authenticate, NULL) < 0) {
+		printf("Failed to enable auth\n");
+		return 1;
+	}
 
 	uv_run(uv_default_loop(), UV_RUN_DEFAULT);
 

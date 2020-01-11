@@ -71,6 +71,9 @@ enum rfb_vencrypt_subtype {
 	RFB_VENCRYPT_TLS_NONE,
 	RFB_VENCRYPT_TLS_VNC,
 	RFB_VENCRYPT_TLS_PLAIN,
+	RFB_VENCRYPT_X509_NONE,
+	RFB_VENCRYPT_X509_VNC,
+	RFB_VENCRYPT_X509_PLAIN,
 };
 
 struct rfb_security_types_msg {
