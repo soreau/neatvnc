@@ -81,7 +81,6 @@ static const char* fourcc_to_string(uint32_t fourcc)
 
 static void client_close(struct nvnc_client* client)
 {
-	printf("Closing client...\n");
 	stream_destroy(client->net_stream);
 
 	nvnc_client_fn fn = client->cleanup_fn;
@@ -97,7 +96,6 @@ static void client_close(struct nvnc_client* client)
 
 static inline void client_unref(struct nvnc_client* client)
 {
-	printf("client unref %d\n", client->ref);
 	if (--client->ref == 0)
 		client_close(client);
 }
@@ -292,8 +290,6 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 
 	username[MIN(ulen, sizeof(username) - 1)] = '\0';
 	password[MIN(plen, sizeof(password) - 1)] = '\0';
-
-	printf("Got auth %s:%s\n", username, password);
 
 	if (server->auth_fn(username, password, server->auth_ud))
 		security_handshake_ok(client);
@@ -621,8 +617,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	struct nvnc_client* client = stream->userdata;
 
 	if (event == STREAM_EVENT_REMOTE_CLOSED) {
-		printf("Got close event\n");
-		stream_close(client->net_stream);
+		stream_close(stream);
 		client_unref(client);
 		return;
 	}
@@ -637,7 +632,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 
 	if (n_read < 0) {
 		if (errno != EAGAIN) {
-			stream_close(client->net_stream);
+			stream_close(stream);
 			client_unref(client);
 		}
 
@@ -779,7 +774,6 @@ void nvnc_close(struct nvnc* self)
 
 static void on_write_frame_done(void* userdata, enum stream_req_status status)
 {
-	printf("Done writing frame\n");
 	struct nvnc_client* client = userdata;
 	client->is_updating = false;
 	client_unref(client);
@@ -835,14 +829,11 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 {
 	(void)status;
 
-	printf("Update fb done\n");
-
 	struct fb_update_work* update = (void*)work;
 	struct nvnc_client* client = update->client;
 	struct vec* frame = &update->frame;
 
 	if (client->net_stream->state != STREAM_STATE_CLOSED) {
-		printf("Writing to stream\n");
 		struct rcbuf* payload = rcbuf_new(frame->data, frame->len);
 		stream_write(client->net_stream, payload, on_write_frame_done,
 		             client);

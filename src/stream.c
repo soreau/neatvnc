@@ -118,8 +118,6 @@ static int stream__flush_plain(struct stream* self)
 	if (n_msgs < 0)
 		return 0;
 
-	printf("Flush\n");
-
 	bytes_sent = writev(self->fd, iov, n_msgs);
 	if (bytes_sent < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -132,8 +130,6 @@ static int stream__flush_plain(struct stream* self)
 
 		return bytes_sent;
 	}
-
-	printf("Flushed %lu\n", bytes_sent);
 
 	ssize_t bytes_left = bytes_sent;
 
@@ -177,7 +173,7 @@ static int stream__flush_tls(struct stream* self)
 			if (err == SSL_ERROR_WANT_WRITE)
 				stream__poll_rw(self);
 			else if (err != SSL_ERROR_WANT_READ) {
-				// TODO: Do more to close the socket
+				stream__remote_closed(self);
 				errno = EPIPE;
 				return -1;
 			}
@@ -337,13 +333,11 @@ ssize_t stream_read(struct stream* self, void* dst, size_t size)
 
 static int stream__try_tls_accept(struct stream* self)
 {
-	printf("Trying TLS handshake\n");
 	int rc = SSL_accept(self->ssl);
 	if (rc == 0)
 		return -1;
 
 	if (rc == 1) {
-		printf("TLS handshake done\n");
 		self->state = STREAM_STATE_TLS_READY;
 		stream__poll_r(self);
 		return 0;
@@ -367,7 +361,6 @@ static int stream__try_tls_accept(struct stream* self)
 
 int stream_upgrade_to_tls(struct stream* self, void* context)
 {
-	printf("Upgrading to TLS\n");
 	self->ssl = SSL_new(context);
 	if (!self->ssl)
 		return -1;
