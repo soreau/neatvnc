@@ -60,8 +60,11 @@ static void stream_req__finish(struct stream_req* req, enum stream_req_status st
 	free(req);
 }
 
-static void stream__close(struct stream* self)
+int stream_close(struct stream* self)
 {
+	if (self->state == STREAM_STATE_CLOSED)
+		return -1;
+
 	self->state = STREAM_STATE_CLOSED;
 
 	while (!TAILQ_EMPTY(&self->send_queue)) {
@@ -77,17 +80,24 @@ static void stream__close(struct stream* self)
 #endif
 
 	uv_poll_stop(&self->uv_poll);
-	if (self->fd >= 0)
-		close(self->fd);
+	close(self->fd);
 	self->fd = -1;
+
+	return 0;
+}
+
+void stream_destroy(struct stream* self)
+{
+	stream_close(self);
+	free(self);
 }
 
 static void stream__remote_closed(struct stream* self)
 {
-	stream__close(self);
+	stream_close(self);
 
 	if (self->on_event)
-		self->on_event(self, STREAM_EVENT_CLOSE);
+		self->on_event(self, STREAM_EVENT_REMOTE_CLOSED);
 }
 
 static int stream__flush_plain(struct stream* self)
@@ -243,15 +253,12 @@ static void stream__on_event(uv_poll_t* uv_poll, int status, int events)
 		stream__remote_closed(self);
 }
 
-struct stream* stream_new(enum stream_flags flags, int fd,
-                          stream_event_fn on_event, void* userdata)
+struct stream* stream_new(int fd, stream_event_fn on_event, void* userdata)
 {
 	struct stream* self = calloc(1, sizeof(*self));
 	if (!self)
 		return NULL;
 
-	self->ref = 1;
-	self->flags |= flags;
 	self->fd = fd;
 	self->on_event = on_event;
 	self->userdata = userdata;
@@ -270,23 +277,6 @@ struct stream* stream_new(enum stream_flags flags, int fd,
 failure:
 	free(self);
 	return NULL;
-}
-
-void stream_ref(struct stream* self)
-{
-	++self->ref;
-}
-
-void stream_unref(struct stream* self)
-{
-	assert(self->ref > 0);
-
-	if (--self->ref != 0)
-		return;
-
-	stream__close(self);
-
-	free(self);
 }
 
 int stream_write(struct stream* self, struct rcbuf* payload,

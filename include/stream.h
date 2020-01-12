@@ -48,7 +48,7 @@ enum stream_req_status {
 
 enum stream_event {
 	STREAM_EVENT_READ,
-	STREAM_EVENT_CLOSE,
+	STREAM_EVENT_REMOTE_CLOSED,
 };
 
 struct stream;
@@ -66,8 +66,6 @@ struct stream_req {
 TAILQ_HEAD(stream_send_queue, stream_req);
 
 struct stream {
-	int ref;
-	enum stream_flags flags;
 	enum stream_state state;
 
 	int fd;
@@ -82,10 +80,9 @@ struct stream {
 #endif
 };
 
-struct stream* stream_new(enum stream_flags flags, int fd,
-                          stream_event_fn on_event, void* userdata);
-void stream_ref(struct stream* self);
-void stream_unref(struct stream* self);
+struct stream* stream_new(int fd, stream_event_fn on_event, void* userdata);
+int stream_close(struct stream* self);
+void stream_destroy(struct stream* self);
 ssize_t stream_read(struct stream* self, void* dst, size_t size);
 int stream_write(struct stream* self, struct rcbuf* payload,
                  stream_req_fn on_done, void* userdata);

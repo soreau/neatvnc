@@ -82,7 +82,7 @@ static const char* fourcc_to_string(uint32_t fourcc)
 static void client_close(struct nvnc_client* client)
 {
 	printf("Closing client...\n");
-	stream_unref(client->net_stream);
+	stream_destroy(client->net_stream);
 
 	nvnc_client_fn fn = client->cleanup_fn;
 	if (fn)
@@ -620,8 +620,9 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 {
 	struct nvnc_client* client = stream->userdata;
 
-	if (event == STREAM_EVENT_CLOSE) {
+	if (event == STREAM_EVENT_REMOTE_CLOSED) {
 		printf("Got close event\n");
+		stream_close(client->net_stream);
 		client_unref(client);
 		return;
 	}
@@ -635,8 +636,10 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 		goto done;
 
 	if (n_read < 0) {
-		if (errno != EAGAIN)
+		if (errno != EAGAIN) {
+			stream_close(client->net_stream);
 			client_unref(client);
+		}
 
 		goto done;
 	}
@@ -701,7 +704,7 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	int fd = accept(server->fd, NULL, 0);
 	assert(fd >= 0); //TODO
 
-	client->net_stream = stream_new(0, fd, on_client_event, client);
+	client->net_stream = stream_new(fd, on_client_event, client);
 	assert(client->net_stream); // TODO
 
 	struct rcbuf* payload = rcbuf_from_string(RFB_VERSION_MESSAGE);
@@ -838,7 +841,7 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 	struct nvnc_client* client = update->client;
 	struct vec* frame = &update->frame;
 
-	if (client->net_stream->fd >= 0) {
+	if (client->net_stream->state != STREAM_STATE_CLOSED) {
 		printf("Writing to stream\n");
 		struct rcbuf* payload = rcbuf_new(frame->data, frame->len);
 		stream_write(client->net_stream, payload, on_write_frame_done,
@@ -912,7 +915,7 @@ int nvnc_feed_frame(struct nvnc* self, struct nvnc_fb* fb,
 	nvnc_fb_ref(self->frame);
 
 	LIST_FOREACH (client, &self->clients, link) {
-		if (client->net_stream->fd < 0)
+		if (client->net_stream->state == STREAM_STATE_CLOSED)
 			continue;
 
 		pixman_region_union(&client->damage, &client->damage,
