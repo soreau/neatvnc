@@ -29,6 +29,7 @@ enum stream_state {
 	STREAM_STATE_NORMAL = 0,
 	STREAM_STATE_TLS_HANDSHAKE,
 	STREAM_STATE_TLS_READY,
+	STREAM_STATE_CLOSED,
 };
 
 enum stream_flags {

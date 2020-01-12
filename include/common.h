@@ -40,7 +40,6 @@ struct nvnc_common {
 struct nvnc_client {
 	struct nvnc_common common;
 	int ref;
-	struct uv_tcp_s stream_handle;
 	struct stream* net_stream;
 	struct nvnc* server;
 	enum nvnc_client_state state;

@@ -60,11 +60,31 @@ static void stream_req__finish(struct stream_req* req, enum stream_req_status st
 	free(req);
 }
 
+static void stream__close(struct stream* self)
+{
+	self->state = STREAM_STATE_CLOSED;
+
+	while (!TAILQ_EMPTY(&self->send_queue)) {
+		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
+		TAILQ_REMOVE(&self->send_queue, req, link);
+		stream_req__finish(req, STREAM_REQ_FAILED);
+	}
+
+#ifdef ENABLE_TLS
+	if (self->ssl)
+		SSL_free(self->ssl);
+	self->ssl = NULL;
+#endif
+
+	uv_poll_stop(&self->uv_poll);
+	if (self->fd >= 0)
+		close(self->fd);
+	self->fd = -1;
+}
+
 static void stream__remote_closed(struct stream* self)
 {
-	uv_poll_stop(&self->uv_poll);
-	close(self->fd);
-	self->fd = -1;
+	stream__close(self);
 
 	if (self->on_event)
 		self->on_event(self, STREAM_EVENT_CLOSE);
@@ -117,7 +137,9 @@ static int stream__flush_plain(struct stream* self)
 		} else {
 			char* p = req->payload->payload;
 			size_t s = req->payload->size;
-			memmove(p, p + s - bytes_left, -bytes_left);
+			memmove(p, p + s + bytes_left, -bytes_left);
+			req->payload->size = -bytes_left;
+			stream__poll_rw(self);
 		}
 
 		if (bytes_left <= 0)
@@ -136,8 +158,6 @@ static int stream__flush_tls(struct stream* self)
 {
 	while (!TAILQ_EMPTY(&self->send_queue)) {
 		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
-
-		printf("SSL_write\n");
 
 		size_t n_bytes = 0;
 		int rc = SSL_write_ex(self->ssl, req->payload->payload,
@@ -189,6 +209,8 @@ static void stream__on_readable(struct stream* self)
 	case STREAM_STATE_TLS_HANDSHAKE:
 		stream__try_tls_accept(self);
 		break;
+	case STREAM_STATE_CLOSED:
+		break;
 	}
 }
 
@@ -201,6 +223,8 @@ static void stream__on_writable(struct stream* self)
 		break;
 	case STREAM_STATE_TLS_HANDSHAKE:
 		stream__try_tls_accept(self);
+		break;
+	case STREAM_STATE_CLOSED:
 		break;
 	}
 }
@@ -260,20 +284,8 @@ void stream_unref(struct stream* self)
 	if (--self->ref != 0)
 		return;
 
-#ifdef ENABLE_TLS
-	if (self->ssl)
-		SSL_free(self->ssl);
-#endif
+	stream__close(self);
 
-	while (!TAILQ_EMPTY(&self->send_queue)) {
-		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
-		TAILQ_REMOVE(&self->send_queue, req, link);
-		stream_req__finish(req, STREAM_REQ_FAILED);
-	}
-
-	uv_poll_stop(&self->uv_poll);
-	if (self->fd >= 0)
-		close(self->fd);
 	free(self);
 }
 

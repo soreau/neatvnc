@@ -455,7 +455,7 @@ static void process_fb_update_requests(struct nvnc_client* client)
 	if (!client->server->frame)
 		return;
 
-	if (uv_is_closing((uv_handle_t*)&client->stream_handle))
+	if (client->net_stream->fd < 0)
 		return;
 
 	if (!pixman_region_not_empty(&client->damage))
@@ -621,6 +621,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	struct nvnc_client* client = stream->userdata;
 
 	if (event == STREAM_EVENT_CLOSE) {
+		printf("Got close event\n");
 		client_unref(client);
 		return;
 	}
@@ -657,7 +658,6 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 		if (rc == 0)
 			break;
 
-		printf("buffer index += %d\n", rc);
 		client->buffer_index += rc;
 	}
 
@@ -776,6 +776,7 @@ void nvnc_close(struct nvnc* self)
 
 static void on_write_frame_done(void* userdata, enum stream_req_status status)
 {
+	printf("Done writing frame\n");
 	struct nvnc_client* client = userdata;
 	client->is_updating = false;
 	client_unref(client);
@@ -831,18 +832,20 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 {
 	(void)status;
 
+	printf("Update fb done\n");
+
 	struct fb_update_work* update = (void*)work;
 	struct nvnc_client* client = update->client;
 	struct vec* frame = &update->frame;
 
-	if (!uv_is_closing((uv_handle_t*)&client->stream_handle)) {
+	if (client->net_stream->fd >= 0) {
+		printf("Writing to stream\n");
 		struct rcbuf* payload = rcbuf_new(frame->data, frame->len);
 		stream_write(client->net_stream, payload, on_write_frame_done,
 		             client);
 	} else {
 		client->is_updating = false;
 		vec_destroy(frame);
-		client_unref(client);
 	}
 
 	client->n_pending_requests--;
@@ -909,7 +912,7 @@ int nvnc_feed_frame(struct nvnc* self, struct nvnc_fb* fb,
 	nvnc_fb_ref(self->frame);
 
 	LIST_FOREACH (client, &self->clients, link) {
-		if (uv_is_closing((uv_handle_t*)&client->stream_handle))
+		if (client->net_stream->fd < 0)
 			continue;
 
 		pixman_region_union(&client->damage, &client->damage,
