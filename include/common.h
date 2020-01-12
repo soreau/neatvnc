@@ -12,7 +12,7 @@
 #include "config.h"
 
 #ifdef ENABLE_TLS
-#include <openssl/ssl.h>
+#include <gnutls/gnutls.h>
 #endif
 
 #define MAX_ENCODINGS 32
@@ -81,7 +81,7 @@ struct nvnc {
 	struct nvnc_fb* frame;
 
 #ifdef ENABLE_TLS
-	SSL_CTX* tls;
+	gnutls_certificate_credentials_t tls_creds;
 	nvnc_auth_fn auth_fn;
 	void* auth_ud;
 #endif

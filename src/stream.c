@@ -14,8 +14,6 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <openssl/err.h>
-#include <openssl/ssl.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -24,6 +22,10 @@
 #include <errno.h>
 #include <sys/uio.h>
 #include <uv.h>
+
+#ifdef ENABLE_TLS
+#include <gnutls/gnutls.h>
+#endif
 
 #include "type-macros.h"
 #include "rcbuf.h"
@@ -74,9 +76,9 @@ int stream_close(struct stream* self)
 	}
 
 #ifdef ENABLE_TLS
-	if (self->ssl)
-		SSL_free(self->ssl);
-	self->ssl = NULL;
+	if (self->tls_session)
+		gnutls_deinit(self->tls_session);
+	self->tls_session = NULL;
 #endif
 
 	uv_poll_stop(&self->uv_poll);
@@ -165,23 +167,28 @@ static int stream__flush_tls(struct stream* self)
 	while (!TAILQ_EMPTY(&self->send_queue)) {
 		struct stream_req* req = TAILQ_FIRST(&self->send_queue);
 
-		size_t n_bytes = 0;
-		int rc = SSL_write_ex(self->ssl, req->payload->payload,
-		                      req->payload->size, &n_bytes);
-		if (rc == 0) {
-			int err = SSL_get_error(self->ssl, rc);
-			if (err == SSL_ERROR_WANT_WRITE)
-				stream__poll_rw(self);
-			else if (err != SSL_ERROR_WANT_READ) {
-				stream__remote_closed(self);
-				errno = EPIPE;
-				return -1;
-			}
-
-			break;
+		ssize_t rc = gnutls_record_send(
+			self->tls_session, req->payload->payload,
+			req->payload->size);
+		if (rc < 0) {
+			gnutls_record_discard_queued(self->tls_session);
+			if (gnutls_error_is_fatal(rc))
+				stream_close(self);
+			return -1;
 		}
 
-		// TODO: Enable and handle partial writes
+		ssize_t remaining = req->payload->size - rc;
+
+		if (remaining > 0) {
+			char* p = req->payload->payload;
+			size_t s = req->payload->size;
+			memmove(p, p + s - remaining, remaining);
+			req->payload->size = remaining;
+			stream__poll_rw(self);
+			return 1;
+		}
+
+		assert(remaining == 0);
 
 		TAILQ_REMOVE(&self->send_queue, req, link);
 		stream_req__finish(req, STREAM_REQ_DONE);
@@ -302,17 +309,24 @@ ssize_t stream__read_plain(struct stream* self, void* dst, size_t size)
 ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 {
 #ifdef ENABLE_TLS
-	int rc = SSL_read(self->ssl, dst, size);
-	if (rc > 0)
+	ssize_t rc = gnutls_record_recv(self->tls_session, dst, size);
+	if (rc >= 0)
 		return rc;
 
-	int err = SSL_get_error(self->ssl, rc);
-	if (err == SSL_ERROR_WANT_READ) {
+	switch (rc) {
+	case GNUTLS_E_INTERRUPTED:
+		errno = EINTR;
+		break;
+	case GNUTLS_E_AGAIN:
 		errno = EAGAIN;
-		return -1;
+		break;
+	default:
+		errno = 0;
+		break;
 	}
 
-	errno = EPIPE;
+	// Make sure data wasn't being written.
+	assert(gnutls_record_get_direction(self->tls_session) == 0);
 #endif
 	return -1;
 }
@@ -336,27 +350,25 @@ ssize_t stream_read(struct stream* self, void* dst, size_t size)
 
 static int stream__try_tls_accept(struct stream* self)
 {
-	int rc = SSL_accept(self->ssl);
-	if (rc == 0)
-		return -1;
+	int rc;
 
-	if (rc == 1) {
+	rc = gnutls_handshake(self->tls_session);
+	if (rc == GNUTLS_E_SUCCESS) {
 		self->state = STREAM_STATE_TLS_READY;
 		stream__poll_r(self);
 		return 0;
 	}
 
-	assert(rc < 0);
-	int err = SSL_get_error(self->ssl, rc);
-
-	if (err == SSL_ERROR_WANT_READ)
-		stream__poll_r(self);
-	else if (err == SSL_ERROR_WANT_WRITE)
-		stream__poll_w(self);
-	else {
-		ERR_print_errors_fp(stderr);
+	if (gnutls_error_is_fatal(rc)) {
+		uv_poll_stop(&self->uv_poll);
 		return -1;
 	}
+
+	int was_writing = gnutls_record_get_direction(self->tls_session);
+	if (was_writing)
+		stream__poll_w(self);
+	else
+		stream__poll_r(self);
 
 	self->state = STREAM_STATE_TLS_HANDSHAKE;
 	return 0;
@@ -364,11 +376,26 @@ static int stream__try_tls_accept(struct stream* self)
 
 int stream_upgrade_to_tls(struct stream* self, void* context)
 {
-	self->ssl = SSL_new(context);
-	if (!self->ssl)
+	int rc;
+
+	rc = gnutls_init(&self->tls_session, GNUTLS_SERVER | GNUTLS_NONBLOCK);
+	if (rc != GNUTLS_E_SUCCESS)
 		return -1;
 
-	SSL_set_fd(self->ssl, self->fd);
+	rc = gnutls_set_default_priority(self->tls_session);
+	if (rc != GNUTLS_E_SUCCESS)
+		goto failure;
+
+	rc = gnutls_credentials_set(self->tls_session, GNUTLS_CRD_CERTIFICATE,
+	                            context);
+	if (rc != GNUTLS_E_SUCCESS)
+		goto failure;
+
+	gnutls_transport_set_int(self->tls_session, self->fd);
 
 	return stream__try_tls_accept(self);
+
+failure:
+	gnutls_deinit(self->tls_session);
+	return -1;
 }

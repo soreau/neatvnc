@@ -36,7 +36,7 @@ libm = cc.find_library('m', required: false)
 pixman = dependency('pixman-1')
 libuv = dependency('libuv')
 libturbojpeg = dependency('libturbojpeg', required: get_option('tight-encoding'))
-openssl = dependency('openssl', required: get_option('tls'))
+gnutls = dependency('gnutls', required: get_option('tls'))
 
 inc = include_directories('include', 'contrib/miniz')
 
@@ -67,8 +67,8 @@ if libturbojpeg.found()
 	config.set('ENABLE_TIGHT', true)
 endif
 
-if openssl.found()
-	dependencies += openssl
+if gnutls.found()
+	dependencies += gnutls
 	config.set('ENABLE_TLS', true)
 endif
 

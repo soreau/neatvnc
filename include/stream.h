@@ -21,8 +21,7 @@
 #include "rcbuf.h"
 
 #ifdef ENABLE_TLS
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <gnutls/gnutls.h>
 #endif
 
 enum stream_state {
@@ -30,10 +29,6 @@ enum stream_state {
 	STREAM_STATE_TLS_HANDSHAKE,
 	STREAM_STATE_TLS_READY,
 	STREAM_STATE_CLOSED,
-};
-
-enum stream_flags {
-	STREAM_TLS = 1 << 0,
 };
 
 enum stream_status {
@@ -76,7 +71,7 @@ struct stream {
 	struct stream_send_queue send_queue;
 
 #ifdef ENABLE_TLS
-	SSL* ssl;
+	gnutls_session_t tls_session;
 #endif
 };
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Andri Yngvason
+ * Copyright (c) 2019 - 2020 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -38,8 +38,7 @@
 #include <pthread.h>
 
 #ifdef ENABLE_TLS
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include <gnutls/gnutls.h>
 #endif
 
 #ifndef DRM_FORMAT_INVALID
@@ -255,7 +254,7 @@ static int on_vencrypt_subtype_message(struct nvnc_client* client)
 		return 0;
 	}
 
-	if (stream_upgrade_to_tls(client->net_stream, client->server->tls) < 0) {
+	if (stream_upgrade_to_tls(client->net_stream, client->server->tls_creds) < 0) {
 		client_unref(client);
 		return 0;
 	}
@@ -766,7 +765,10 @@ void nvnc_close(struct nvnc* self)
 	close(self->fd);
 
 #ifdef ENABLE_TLS
-	SSL_CTX_free(self->tls);
+	gnutls_certificate_free_credentials(self->tls_creds);
+
+	// TODO: Do something with this that doesn't ruin things for others
+	gnutls_global_deinit();
 #endif
 
 	free(self);
@@ -1002,39 +1004,20 @@ int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
                      void* userdata)
 {
 #ifdef ENABLE_TLS
-	if (self->tls)
+	if (self->tls_creds)
 		return -1;
 
-	OpenSSL_add_all_algorithms();
-	OpenSSL_add_ssl_algorithms();
-	OpenSSL_add_all_ciphers();
-	OpenSSL_add_all_digests();
+	// TODO: There may be a better place for this
+	gnutls_global_init();
 
-	self->tls = SSL_CTX_new(TLS_server_method());
-	if (!self->tls)
-		return -1;
-
-//	SSL_CTX_set_verify(self->tls, SSL_VERIFY_NONE, 0);
-
-	SSL_CTX_set_ecdh_auto(self->tls, 1);
-
-	if (SSL_CTX_use_PrivateKey_file(self->tls, privkey_path,
-	                                SSL_FILETYPE_PEM) < 0)
-		goto failure;
-
-	if (SSL_CTX_use_certificate_file(self->tls, cert_path,
-	                                 SSL_FILETYPE_PEM) < 0)
-		goto failure;
+	gnutls_certificate_allocate_credentials(&self->tls_creds);
+	gnutls_certificate_set_x509_key_file(
+		self->tls_creds, cert_path, privkey_path, GNUTLS_X509_FMT_PEM);
 
 	self->auth_fn = auth_fn;
 	self->auth_ud = userdata;
 
 	return 0;
-
-failure:
-	// TODO: Expose errors to user via nvnc_strerror(struct nvnc*) -> const char*
-	SSL_CTX_free(self->tls);
-	self->tls = NULL;
 #endif
 	return -1;
 }
