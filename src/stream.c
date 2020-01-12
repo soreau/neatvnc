@@ -201,6 +201,7 @@ static int stream__flush(struct stream* self)
 	default:
 		break;
 	}
+	abort();
 	return -1;
 }
 
@@ -216,6 +217,7 @@ static void stream__on_readable(struct stream* self)
 		stream__try_tls_accept(self);
 		break;
 	case STREAM_STATE_CLOSED:
+		abort();
 		break;
 	}
 }
@@ -231,6 +233,7 @@ static void stream__on_writable(struct stream* self)
 		stream__try_tls_accept(self);
 		break;
 	case STREAM_STATE_CLOSED:
+		abort();
 		break;
 	}
 }
@@ -327,7 +330,7 @@ ssize_t stream_read(struct stream* self, void* dst, size_t size)
 	default: break;
 	}
 
-	errno = EAGAIN;
+	abort();
 	return -1;
 }
 
