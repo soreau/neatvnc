@@ -88,10 +88,17 @@ int stream_close(struct stream* self)
 	return 0;
 }
 
+void stream__free_poll_handle(uv_handle_t* handle)
+{
+	uv_poll_t* uv_poll = (uv_poll_t*)handle;
+	struct stream* self = container_of(uv_poll, struct stream, uv_poll);
+	free(self);
+}
+
 void stream_destroy(struct stream* self)
 {
 	stream_close(self);
-	free(self);
+	uv_close((uv_handle_t*)&self->uv_poll, stream__free_poll_handle);
 }
 
 static void stream__remote_closed(struct stream* self)
