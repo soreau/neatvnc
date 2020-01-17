@@ -333,11 +333,6 @@ ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 
 ssize_t stream_read(struct stream* self, void* dst, size_t size)
 {
-	if (self->fd < 0) {
-		errno = EPIPE;
-		return -1;
-	}
-
 	switch (self->state) {
 	case STREAM_STATE_NORMAL: return stream__read_plain(self, dst, size);
 	case STREAM_STATE_TLS_READY: return stream__read_tls(self, dst, size);

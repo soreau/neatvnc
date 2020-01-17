@@ -80,21 +80,23 @@ static const char* fourcc_to_string(uint32_t fourcc)
 
 static void client_close(struct nvnc_client* client)
 {
-	stream_destroy(client->net_stream);
+	printf("Close client %p\n", client);
 
 	nvnc_client_fn fn = client->cleanup_fn;
 	if (fn)
 		fn(client);
 
-	deflateEnd(&client->z_stream);
-
 	LIST_REMOVE(client, link);
+	stream_destroy(client->net_stream);
+	deflateEnd(&client->z_stream);
 	pixman_region_fini(&client->damage);
 	free(client);
 }
 
 static inline void client_unref(struct nvnc_client* client)
 {
+	assert(client->ref > 0);
+
 	if (--client->ref == 0)
 		client_close(client);
 }
@@ -107,6 +109,7 @@ static inline void client_ref(struct nvnc_client* client)
 static void close_after_write(void* userdata, enum stream_req_status status)
 {
 	struct nvnc_client* client = userdata;
+	printf("Close after write %p\n", client);
 	client_unref(client);
 }
 
@@ -327,9 +330,14 @@ static int on_security_message(struct nvnc_client* client)
 static void disconnect_all_other_clients(struct nvnc_client* client)
 {
 	struct nvnc_client* node;
-	LIST_FOREACH (node, &client->server->clients, link)
-		if (node != client)
-			client_unref(client);
+	struct nvnc_client* tmp;
+
+	LIST_FOREACH_SAFE (node, &client->server->clients, link, tmp)
+		if (node != client) {
+			printf("disconnect other client %p\n", node);
+			client_unref(node);
+		}
+
 }
 
 static void send_server_init_message(struct nvnc_client* client)
@@ -450,7 +458,7 @@ static void process_fb_update_requests(struct nvnc_client* client)
 	if (!client->server->frame)
 		return;
 
-	if (client->net_stream->fd < 0)
+	if (client->net_stream->state == STREAM_STATE_CLOSED)
 		return;
 
 	if (!pixman_region_not_empty(&client->damage))
@@ -581,6 +589,7 @@ static int on_client_message(struct nvnc_client* client)
 		return on_client_cut_text(client);
 	}
 
+	printf("Got strange message from client: %p\n", client);
 	client_unref(client);
 	return 0;
 }
@@ -615,7 +624,10 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 {
 	struct nvnc_client* client = stream->userdata;
 
+	assert(client->net_stream == stream);
+
 	if (event == STREAM_EVENT_REMOTE_CLOSED) {
+		printf("Client closed remotely: %p (%d)\n", client, client->ref);
 		stream_close(stream);
 		client_unref(client);
 		return;
@@ -631,6 +643,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 
 	if (n_read < 0) {
 		if (errno != EAGAIN) {
+			printf("Client error: %p\n", client);
 			stream_close(stream);
 			client_unref(client);
 		}
@@ -643,6 +656,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	if ((size_t)n_read > MSG_BUFFER_SIZE - client->buffer_len) {
 		/* Can't handle this. Let's just give up */
 		client->state = VNC_CLIENT_STATE_ERROR;
+		printf("Client whoops: %p\n", client);
 		client_unref(client);
 		goto done;
 	}
@@ -677,6 +691,8 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	struct nvnc_client* client = calloc(1, sizeof(*client));
 	if (!client)
 		return;
+
+	printf("New client %p\n", client);
 
 	client->ref = 1;
 	client->server = server;
@@ -758,7 +774,8 @@ void nvnc_close(struct nvnc* self)
 	if (self->frame)
 		nvnc_fb_unref(self->frame);
 
-	LIST_FOREACH (client, &self->clients, link)
+	struct nvnc_client* tmp;
+	LIST_FOREACH_SAFE (client, &self->clients, link, tmp)
 		client_unref(client);
 
 	uv_poll_stop(&self->poll_handle);
@@ -835,6 +852,8 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 	struct nvnc_client* client = update->client;
 	struct vec* frame = &update->frame;
 
+	client_ref(client);
+
 	if (client->net_stream->state != STREAM_STATE_CLOSED) {
 		struct rcbuf* payload = rcbuf_new(frame->data, frame->len);
 		stream_write(client->net_stream, payload, on_write_frame_done,
@@ -842,6 +861,7 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 	} else {
 		client->is_updating = false;
 		vec_destroy(frame);
+		client_unref(client);
 	}
 
 	client->n_pending_requests--;
@@ -849,6 +869,8 @@ void on_client_update_fb_done(uv_work_t* work, int status)
 	nvnc_fb_unref(update->fb);
 
 	pixman_region_fini(&update->region);
+
+	client_unref(client);
 	free(update);
 }
 
@@ -907,7 +929,8 @@ int nvnc_feed_frame(struct nvnc* self, struct nvnc_fb* fb,
 	self->frame = fb;
 	nvnc_fb_ref(self->frame);
 
-	LIST_FOREACH (client, &self->clients, link) {
+	struct nvnc_client* tmp;
+	LIST_FOREACH_SAFE (client, &self->clients, link, tmp) {
 		if (client->net_stream->state == STREAM_STATE_CLOSED)
 			continue;
 
