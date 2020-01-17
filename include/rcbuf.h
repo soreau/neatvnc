@@ -18,6 +18,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 
 struct rcbuf {
 	void* payload;
@@ -31,7 +32,7 @@ static inline struct rcbuf* rcbuf_new(void* payload, size_t size)
 	if (!self)
 		return NULL;
 
-	self->ref = 0;
+	self->ref = 1;
 	self->payload = payload;
 	self->size = size;
 
@@ -66,6 +67,8 @@ static inline void rcbuf_ref(struct rcbuf* self)
 
 static inline void rcbuf_unref(struct rcbuf* self)
 {
+	assert(self->ref > 0);
+
 	if (--self->ref > 0)
 		return;
 
