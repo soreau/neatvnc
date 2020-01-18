@@ -801,10 +801,10 @@ void nvnc_close(struct nvnc* self)
 	close(self->fd);
 
 #ifdef ENABLE_TLS
-	gnutls_certificate_free_credentials(self->tls_creds);
-
-	// TODO: Do something with this that doesn't ruin things for others
-	gnutls_global_deinit();
+	if (self->tls_creds) {
+		gnutls_certificate_free_credentials(self->tls_creds);
+		gnutls_global_deinit();
+	}
 #endif
 
 	free(self);
@@ -1049,17 +1049,41 @@ int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
 	if (self->tls_creds)
 		return -1;
 
-	// TODO: There may be a better place for this
-	gnutls_global_init();
+	/* Note: This is globally reference counted, so we don't need to worry
+	 * about messing with other libraries.
+	 */
+	int rc = gnutls_global_init();
+	if (rc != GNUTLS_E_SUCCESS) {
+		log_error("GnuTLS: Failed to initialise: %s\n",
+		          gnutls_strerror(rc));
+		return -1;
+	}
 
-	gnutls_certificate_allocate_credentials(&self->tls_creds);
-	gnutls_certificate_set_x509_key_file(
+	rc = gnutls_certificate_allocate_credentials(&self->tls_creds);
+	if (rc != GNUTLS_E_SUCCESS) {
+		log_error("GnuTLS: Failed to allocate credentials: %s\n",
+		          gnutls_strerror(rc));
+		goto cert_alloc_failure;
+	}
+
+	rc = gnutls_certificate_set_x509_key_file(
 		self->tls_creds, cert_path, privkey_path, GNUTLS_X509_FMT_PEM);
+	if (rc != GNUTLS_E_SUCCESS) {
+		log_error("GnuTLS: Failed to load credentials: %s\n",
+		          gnutls_strerror(rc));
+		goto cert_set_failure;
+	}
 
 	self->auth_fn = auth_fn;
 	self->auth_ud = userdata;
 
 	return 0;
+
+cert_set_failure:
+	gnutls_certificate_free_credentials(self->tls_creds);
+	self->tls_creds = NULL;
+cert_alloc_failure:
+	gnutls_global_deinit();
 #endif
 	return -1;
 }
