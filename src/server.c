@@ -699,6 +699,14 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	client->ref = 1;
 	client->server = server;
 
+	int fd = accept(server->fd, NULL, 0);
+	if (fd < 0)
+		goto accept_failure;
+
+	client->net_stream = stream_new(fd, on_client_event, client);
+	if (!client->net_stream)
+		goto stream_failure;
+
 	int rc = deflateInit2(&client->z_stream,
 	                      /* compression level: */ 1,
 	                      /*            method: */ Z_DEFLATED,
@@ -706,21 +714,15 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	                      /*         mem level: */ 9,
 	                      /*          strategy: */ Z_DEFAULT_STRATEGY);
 
-	if (rc != Z_OK) {
-		free(client);
-		return;
-	}
+	if (rc != Z_OK)
+		goto deflate_failure;
 
 	pixman_region_init(&client->damage);
 
-	int fd = accept(server->fd, NULL, 0);
-	assert(fd >= 0); //TODO
-
-	client->net_stream = stream_new(fd, on_client_event, client);
-	assert(client->net_stream); // TODO
-
 	struct rcbuf* payload = rcbuf_from_string(RFB_VERSION_MESSAGE);
-	assert(payload); //TODO
+	if (!payload)
+		goto payload_failure;
+
 	stream_write(client->net_stream, payload, NULL, NULL);
 
 	LIST_INSERT_HEAD(&server->clients, client, link);
@@ -728,6 +730,19 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VERSION;
 
 	log_debug("New client connection: %p (ref %d)\n", client, client->ref);
+
+	return;
+
+payload_failure:
+	deflateEnd(&client->z_stream);
+deflate_failure:
+	stream_destroy(client->net_stream);
+stream_failure:
+	close(fd);
+accept_failure:
+	free(client);
+
+	log_debug("Failed to accept a connection\n");
 }
 
 EXPORT
