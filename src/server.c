@@ -27,6 +27,7 @@
 #include "pixels.h"
 #include "stream.h"
 #include "config.h"
+#include "logging.h"
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -80,7 +81,7 @@ static const char* fourcc_to_string(uint32_t fourcc)
 
 static void client_close(struct nvnc_client* client)
 {
-	printf("Close client %p\n", client);
+	log_debug("client_close(%p): ref %d\n", client, client->ref);
 
 	nvnc_client_fn fn = client->cleanup_fn;
 	if (fn)
@@ -109,7 +110,7 @@ static inline void client_ref(struct nvnc_client* client)
 static void close_after_write(void* userdata, enum stream_req_status status)
 {
 	struct nvnc_client* client = userdata;
-	printf("Close after write %p\n", client);
+	log_debug("close_after_write(%p): ref %d\n", client, client->ref);
 	client_unref(client);
 }
 
@@ -334,7 +335,8 @@ static void disconnect_all_other_clients(struct nvnc_client* client)
 
 	LIST_FOREACH_SAFE (node, &client->server->clients, link, tmp)
 		if (node != client) {
-			printf("disconnect other client %p\n", node);
+			log_debug("disconnect other client %p (ref %d)\n",
+			          node, node->ref);
 			client_unref(node);
 		}
 
@@ -589,7 +591,8 @@ static int on_client_message(struct nvnc_client* client)
 		return on_client_cut_text(client);
 	}
 
-	printf("Got strange message from client: %p\n", client);
+	log_debug("Got uninterpretable message from client: %p (ref %d)\n",
+	          client, client->ref);
 	client_unref(client);
 	return 0;
 }
@@ -627,7 +630,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	assert(client->net_stream == stream);
 
 	if (event == STREAM_EVENT_REMOTE_CLOSED) {
-		printf("Client closed remotely: %p (%d)\n", client, client->ref);
+		log_debug("Client %p (%d) hung up\n", client, client->ref);
 		stream_close(stream);
 		client_unref(client);
 		return;
@@ -643,7 +646,8 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 
 	if (n_read < 0) {
 		if (errno != EAGAIN) {
-			printf("Client error: %p\n", client);
+			log_debug("Client connection error: %p (ref %d)\n",
+				  client, client->ref);
 			stream_close(stream);
 			client_unref(client);
 		}
@@ -656,7 +660,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	if ((size_t)n_read > MSG_BUFFER_SIZE - client->buffer_len) {
 		/* Can't handle this. Let's just give up */
 		client->state = VNC_CLIENT_STATE_ERROR;
-		printf("Client whoops: %p\n", client);
+		log_debug("Client whoops: %p (ref %d)\n", client, client->ref);
 		client_unref(client);
 		goto done;
 	}
@@ -692,8 +696,6 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	if (!client)
 		return;
 
-	printf("New client %p\n", client);
-
 	client->ref = 1;
 	client->server = server;
 
@@ -724,6 +726,8 @@ static void on_connection(uv_poll_t* poll_handle, int status, int events)
 	LIST_INSERT_HEAD(&server->clients, client, link);
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VERSION;
+
+	log_debug("New client connection: %p (ref %d)\n", client, client->ref);
 }
 
 EXPORT
