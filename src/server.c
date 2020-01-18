@@ -265,7 +265,6 @@ static int on_vencrypt_subtype_message(struct nvnc_client* client)
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH;
 
-	// TODO: For tls send one byte containing only 1
 	return sizeof(*msg);
 }
 
