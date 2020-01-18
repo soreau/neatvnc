@@ -256,14 +256,16 @@ static void stream__on_event(uv_poll_t* uv_poll, int status, int events)
 {
 	struct stream* self = container_of(uv_poll, struct stream, uv_poll);
 
-	if (events & UV_WRITABLE)
-		stream__on_writable(self);
+	if (events & UV_DISCONNECT) {
+		stream__remote_closed(self);
+		return;
+	}
 
 	if (events & UV_READABLE)
 		stream__on_readable(self);
 
-	if (events & UV_DISCONNECT)
-		stream__remote_closed(self);
+	if (events & UV_WRITABLE)
+		stream__on_writable(self);
 }
 
 struct stream* stream_new(int fd, stream_event_fn on_event, void* userdata)
