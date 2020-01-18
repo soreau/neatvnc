@@ -198,6 +198,13 @@ static int security_handshake_ok(struct nvnc_client* client)
 	return stream_write(client->net_stream, payload, NULL, NULL);
 }
 
+static int send_byte(struct nvnc_client* client, uint8_t value)
+{
+	struct rcbuf* payload = rcbuf_from_mem(&value, sizeof(value));
+	return stream_write(client->net_stream, payload, NULL, NULL);
+}
+
+#ifdef ENABLE_TLS
 static int vencrypt_send_version(struct nvnc_client* client)
 {
 	struct rfb_vencrypt_version_msg msg = {
@@ -206,12 +213,6 @@ static int vencrypt_send_version(struct nvnc_client* client)
 	};
 
 	struct rcbuf* payload = rcbuf_from_mem(&msg, sizeof(msg));
-	return stream_write(client->net_stream, payload, NULL, NULL);
-}
-
-static int send_byte(struct nvnc_client* client, uint8_t value)
-{
-	struct rcbuf* payload = rcbuf_from_mem(&value, sizeof(value));
 	return stream_write(client->net_stream, payload, NULL, NULL);
 }
 
@@ -302,6 +303,7 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 
 	return sizeof(*msg) + ulen + plen;
 }
+#endif
 
 static int on_security_message(struct nvnc_client* client)
 {
@@ -315,10 +317,12 @@ static int on_security_message(struct nvnc_client* client)
 		security_handshake_ok(client);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 		break;
+#ifdef ENABLE_TLS
 	case RFB_SECURITY_TYPE_VENCRYPT:
 		vencrypt_send_version(client);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_VERSION;
 		break;
+#endif
 	default:
 		handle_invalid_security_type(client);
 		break;
@@ -608,12 +612,14 @@ static int try_read_client_message(struct nvnc_client* client)
 		return on_security_message(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_INIT:
 		return on_init_message(client);
+#ifdef ENABLE_TLS
 	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_VERSION:
 		return on_vencrypt_version_message(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_SUBTYPE:
 		return on_vencrypt_subtype_message(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH:
 		return on_vencrypt_plain_auth_message(client);
+#endif
 	case VNC_CLIENT_STATE_READY:
 		return on_client_message(client);
 	}

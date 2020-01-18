@@ -26,9 +26,11 @@
 
 enum stream_state {
 	STREAM_STATE_NORMAL = 0,
+	STREAM_STATE_CLOSED,
+#ifdef ENABLE_TLS
 	STREAM_STATE_TLS_HANDSHAKE,
 	STREAM_STATE_TLS_READY,
-	STREAM_STATE_CLOSED,
+#endif
 };
 
 enum stream_status {
@@ -82,4 +84,6 @@ ssize_t stream_read(struct stream* self, void* dst, size_t size);
 int stream_write(struct stream* self, struct rcbuf* payload,
                  stream_req_fn on_done, void* userdata);
 
+#ifdef ENABLE_TLS
 int stream_upgrade_to_tls(struct stream* self, void* context);
+#endif

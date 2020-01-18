@@ -33,7 +33,9 @@
 #include "sys/queue.h"
 
 static void stream__on_event(uv_poll_t* uv_poll, int status, int events);
+#ifdef ENABLE_TLS
 static int stream__try_tls_accept(struct stream* self);
+#endif
 
 static inline void stream__poll_r(struct stream* self)
 {
@@ -169,6 +171,7 @@ static int stream__flush_plain(struct stream* self)
 	return bytes_sent;
 }
 
+#ifdef ENABLE_TLS
 static int stream__flush_tls(struct stream* self)
 {
 	while (!TAILQ_EMPTY(&self->send_queue)) {
@@ -206,12 +209,15 @@ static int stream__flush_tls(struct stream* self)
 
 	return 1;
 }
+#endif
 
 static int stream__flush(struct stream* self)
 {
 	switch (self->state) {
 	case STREAM_STATE_NORMAL: return stream__flush_plain(self);
+#ifdef ENABLE_TLS
 	case STREAM_STATE_TLS_READY: return stream__flush_tls(self);
+#endif
 	default:
 		break;
 	}
@@ -223,6 +229,7 @@ static void stream__on_readable(struct stream* self)
 {
 	switch (self->state) {
 	case STREAM_STATE_NORMAL:
+#ifdef ENABLE_TLS
 	case STREAM_STATE_TLS_READY:
 		if (self->on_event)
 			self->on_event(self, STREAM_EVENT_READ);
@@ -230,6 +237,7 @@ static void stream__on_readable(struct stream* self)
 	case STREAM_STATE_TLS_HANDSHAKE:
 		stream__try_tls_accept(self);
 		break;
+#endif
 	case STREAM_STATE_CLOSED:
 		abort();
 		break;
@@ -240,12 +248,14 @@ static void stream__on_writable(struct stream* self)
 {
 	switch (self->state) {
 	case STREAM_STATE_NORMAL:
+#ifdef ENABLE_TLS
 	case STREAM_STATE_TLS_READY:
 		stream__flush(self);
 		break;
 	case STREAM_STATE_TLS_HANDSHAKE:
 		stream__try_tls_accept(self);
 		break;
+#endif
 	case STREAM_STATE_CLOSED:
 		abort();
 		break;
@@ -315,9 +325,9 @@ ssize_t stream__read_plain(struct stream* self, void* dst, size_t size)
 	return read(self->fd, dst, size);
 }
 
+#ifdef ENABLE_TLS
 ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 {
-#ifdef ENABLE_TLS
 	ssize_t rc = gnutls_record_recv(self->tls_session, dst, size);
 	if (rc >= 0)
 		return rc;
@@ -336,15 +346,17 @@ ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 
 	// Make sure data wasn't being written.
 	assert(gnutls_record_get_direction(self->tls_session) == 0);
-#endif
 	return -1;
 }
+#endif
 
 ssize_t stream_read(struct stream* self, void* dst, size_t size)
 {
 	switch (self->state) {
 	case STREAM_STATE_NORMAL: return stream__read_plain(self, dst, size);
+#ifdef ENABLE_TLS
 	case STREAM_STATE_TLS_READY: return stream__read_tls(self, dst, size);
+#endif
 	default: break;
 	}
 
@@ -352,6 +364,7 @@ ssize_t stream_read(struct stream* self, void* dst, size_t size)
 	return -1;
 }
 
+#ifdef ENABLE_TLS
 static int stream__try_tls_accept(struct stream* self)
 {
 	int rc;
@@ -403,3 +416,4 @@ failure:
 	gnutls_deinit(self->tls_session);
 	return -1;
 }
+#endif
