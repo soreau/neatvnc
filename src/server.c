@@ -111,6 +111,7 @@ static void close_after_write(void* userdata, enum stream_req_status status)
 {
 	struct nvnc_client* client = userdata;
 	log_debug("close_after_write(%p): ref %d\n", client, client->ref);
+	stream_close(client->net_stream);
 	client_unref(client);
 }
 
@@ -255,13 +256,15 @@ static int on_vencrypt_subtype_message(struct nvnc_client* client)
 	enum rfb_vencrypt_subtype subtype = ntohl(*msg);
 
 	if (subtype != RFB_VENCRYPT_X509_PLAIN) {
+		stream_close(client->net_stream);
 		client_unref(client);
-		return 0;
+		return sizeof(*msg);
 	}
 
 	if (stream_upgrade_to_tls(client->net_stream, client->server->tls_creds) < 0) {
+		stream_close(client->net_stream);
 		client_unref(client);
-		return 0;
+		return sizeof(*msg);
 	}
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH;
@@ -294,12 +297,14 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 	username[MIN(ulen, sizeof(username) - 1)] = '\0';
 	password[MIN(plen, sizeof(password) - 1)] = '\0';
 
-	if (server->auth_fn(username, password, server->auth_ud))
+	if (server->auth_fn(username, password, server->auth_ud)) {
+		log_debug("User \"%s\" authenticated\n", username);
 		security_handshake_ok(client);
-	else
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+	} else {
+		log_debug("User \"%s\" rejected\n", username);
 		handle_invalid_security_type(client); // TODO say wrong auth
-
-	client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+	}
 
 	return sizeof(*msg) + ulen + plen;
 }
@@ -340,6 +345,7 @@ static void disconnect_all_other_clients(struct nvnc_client* client)
 		if (node != client) {
 			log_debug("disconnect other client %p (ref %d)\n",
 			          node, node->ref);
+			stream_close(node->net_stream);
 			client_unref(node);
 		}
 
@@ -355,6 +361,7 @@ static void send_server_init_message(struct nvnc_client* client)
 
 	struct rfb_server_init_msg* msg = calloc(1, size);
 	if (!msg) {
+		stream_close(client->net_stream);
 		client_unref(client);
 		return;
 	}
@@ -365,6 +372,7 @@ static void send_server_init_message(struct nvnc_client* client)
 
 	int rc = rfb_pixfmt_from_fourcc(&msg->pixel_format, display->pixfmt);
 	if (rc < 0) {
+		stream_close(client->net_stream);
 		client_unref(client);
 		return;
 	}
@@ -408,6 +416,7 @@ static int on_client_set_pixel_format(struct nvnc_client* client)
 
 	if (!fmt->true_colour_flag) {
 		/* We don't really know what to do with color maps right now */
+		stream_close(client->net_stream);
 		client_unref(client);
 		return 0;
 	}
@@ -596,6 +605,7 @@ static int on_client_message(struct nvnc_client* client)
 
 	log_debug("Got uninterpretable message from client: %p (ref %d)\n",
 	          client, client->ref);
+	stream_close(client->net_stream);
 	client_unref(client);
 	return 0;
 }
@@ -604,8 +614,7 @@ static int try_read_client_message(struct nvnc_client* client)
 {
 	switch (client->state) {
 	case VNC_CLIENT_STATE_ERROR:
-		client_unref(client);
-		return 0;
+		return client->buffer_len - client->buffer_index;
 	case VNC_CLIENT_STATE_WAITING_FOR_VERSION:
 		return on_version_message(client);
 	case VNC_CLIENT_STATE_WAITING_FOR_SECURITY:
@@ -666,6 +675,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 		/* Can't handle this. Let's just give up */
 		client->state = VNC_CLIENT_STATE_ERROR;
 		log_debug("Client whoops: %p (ref %d)\n", client, client->ref);
+		stream_close(client->net_stream);
 		client_unref(client);
 		goto done;
 	}

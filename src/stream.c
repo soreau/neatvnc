@@ -163,7 +163,7 @@ static int stream__flush_plain(struct stream* self)
 			break;
 	}
 
-	if (bytes_left == 0)
+	if (bytes_left == 0 && self->state != STREAM_STATE_CLOSED)
 		stream__poll_r(self);
 
 	assert(bytes_left <= 0);
@@ -204,7 +204,7 @@ static int stream__flush_tls(struct stream* self)
 		stream_req__finish(req, STREAM_REQ_DONE);
 	}
 
-	if (TAILQ_EMPTY(&self->send_queue))
+	if (TAILQ_EMPTY(&self->send_queue) && self->state != STREAM_STATE_CLOSED)
 		stream__poll_r(self);
 
 	return 1;
@@ -307,6 +307,9 @@ failure:
 int stream_write(struct stream* self, struct rcbuf* payload,
                  stream_req_fn on_done, void* userdata)
 {
+	if (self->state == STREAM_STATE_CLOSED)
+		return -1;
+
 	struct stream_req* req = calloc(1, sizeof(*req));
 	if (!req)
 		return -1;
